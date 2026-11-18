@@ -1,4 +1,4 @@
-# Nero_ws
+# Nero_ws (Grupo 2)
 
 
 ## Quick Start
