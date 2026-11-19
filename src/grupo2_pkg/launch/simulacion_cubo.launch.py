@@ -8,7 +8,9 @@ Levanta:
      Una rutina opcional `routine` de grupo2_pkg los publica.
   3. Opcional: la cinta automatica (cube:=true).
 
-La rutina y la cinta arrancan cuando can_module termina la pose inicial.
+La rutina y la cinta arrancan cuando can_module termina la pose inicial. Se reenvia
+/start_running_nodes (ver orden_arranque) porque esa pose inicial depende de un
+mensaje que can_module puede perderse por una carrera de arranque.
 P2 y P3 incluyen este launch: interceptar_cubo.launch.py y recoger_cubo.launch.py.
 
 Ejemplos:
@@ -44,6 +46,24 @@ RECORRIDO = 1.60
 
 # Ultima linea de can_module al enviar la pose inicial.
 FIN_POSE_INICIAL = 'Published initial joint states (attempt 3/3)'
+
+
+def orden_arranque():
+    """Reenvia /start_running_nodes esperando a que can_module escuche.
+
+    main_node lo publica una sola vez (latcheado, TRANSIENT_LOCAL) al segundo de
+    arrancar, pero can_module se suscribe VOLATILE, asi que no recibe el latch si
+    el descubrimiento DDS se completa despues de esa publicacion: se queda sin
+    arrancar, no manda la pose inicial y con ello no arranca ni la rutina ni la
+    cinta del cubo. Con `-w 1` esperamos a que su suscriptor exista antes de
+    publicar, asi que la entrega esta garantizada. Reenviarlo es inofensivo:
+    can_module ignora el segundo (guarda `if msg.data and not self.start_requested`).
+    """
+    return ExecuteProcess(
+        cmd=['ros2', 'topic', 'pub', '--once', '-w', '1', '/start_running_nodes',
+             'std_msgs/msg/Bool', '{data: true}'],
+        output='screen',
+    )
 
 
 def orden_cubo(datos):
@@ -121,4 +141,5 @@ def generate_launch_description():
                               description='Segundos tras la pose inicial antes de arrancar la cinta'),
         al_terminar_pose_inicial([OpaqueFunction(function=nodos_tras_pose_inicial)]),
         simulacion,
+        orden_arranque(),
     ])
