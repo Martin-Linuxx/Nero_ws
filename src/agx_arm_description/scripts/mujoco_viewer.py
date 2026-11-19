@@ -17,6 +17,7 @@ Feedback (publicaciones):
                                      joints de MuJoCo (gripper_joint1/2, por dedo)
   feedback/tcp_pose     PoseStamped  pose de link7 respecto a base_link
   proximity             Range        sensor de proximidad simulado (sim_proximity.py)
+  feedback/cubo_*       ...          cinta del cubo, escucha control/cubo (sim_cubo.py)
 
 Convenciones:
   - Poses en el marco de base_link, cuaternion ROS (x, y, z, w). Por defecto la pose
@@ -50,6 +51,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped, PoseArray
 
+from sim_cubo import SimCubo
 from sim_proximity import SimProximitySensor
 
 ARM_JOINTS = [f'joint{i}' for i in range(1, 8)]
@@ -287,6 +289,8 @@ class MujocoBridge(Node):
 
         # P4: sensor de proximidad simulado en /proximity.
         self.proximity = SimProximitySensor(self, self.model, self.data, self._data_lock)
+        # Cinta del cubo: /control/cubo -> feedback/cubo_pose, cubo_contacto, cubo_agarre.
+        self.cubo = SimCubo(self, self.model, self.data, self._data_lock)
 
         self.get_logger().info(
             f'Comandos: "{control_topic}" (directo), "{move_j_topic}", control/move_p, '
@@ -646,6 +650,7 @@ class MujocoBridge(Node):
     def step(self):
         with self._data_lock:
             self._advance_trajectory()
+            self.cubo.step()
             mujoco.mj_step(self.model, self.data)
 
 
