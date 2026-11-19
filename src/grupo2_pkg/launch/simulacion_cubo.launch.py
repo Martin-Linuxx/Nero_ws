@@ -4,7 +4,7 @@ Levanta:
   1. MuJoCo con scene_nero_cubo.xml (nero_ctrl, mode:=sim). El puente publica
      /proximity, /feedback/cubo_pose, /feedback/cubo_contacto y /feedback/cubo_agarre,
      y mueve el cubo segun /control/cubo.
-  2. La rutina `routine` de grupo2_pkg (por defecto control_test_node).
+  2. La rutina `routine` de grupo2_pkg (por defecto waypoint_manager).
   3. Opcional: ik_node (ik:=true) y la cinta automatica (cube:=true).
 
 La rutina, ik_node y la cinta arrancan cuando can_module termina la pose inicial.
@@ -107,7 +107,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('rviz', default_value='false', choices=['true', 'false'],
                               description='Lanzar RViz2 junto a MuJoCo'),
-        DeclareLaunchArgument('routine', default_value='control_test_node',
+        DeclareLaunchArgument('routine', default_value='waypoint_manager',
                               description='Ejecutable de grupo2_pkg a lanzar ("none" = ninguno)'),
         DeclareLaunchArgument('ik', default_value='false', choices=['true', 'false'],
                               description='Lanzar ik_node (rutinas que usan /obj_point)'),
