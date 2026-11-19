@@ -26,6 +26,7 @@ from collections import deque
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from geometry_msgs.msg import PoseStamped
 from grupo2_interfaces.msg import Waypoint
 from rclpy.node import Node
@@ -298,7 +299,7 @@ def main(args=None):
     node = InterceptarCubo()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

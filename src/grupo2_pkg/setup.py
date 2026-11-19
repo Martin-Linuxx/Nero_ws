@@ -8,7 +8,7 @@ package_name = 'grupo2_pkg'
 setup(
     name=package_name,
     version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    packages=find_packages(exclude=['test', 'test.*']),
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -28,13 +28,12 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'movimiento_continuo = grupo2_pkg.movimiento_continuo:main',
+            'waypoint_manager = grupo2_pkg.waypoint_manager:main',
             'interceptar_cubo = grupo2_pkg.interceptar_cubo:main',
             'recoger_cubo = grupo2_pkg.recoger_cubo:main',
-            'ik_node = grupo2_pkg.ik_node:main',
-            'waypoint_manager = grupo2_pkg.waypoint_manager:main',
             'waypoint_sender = grupo2_pkg.waypoint_sender:main',
             'pose_probe = grupo2_pkg.pose_probe:main',
+            'proximity_sensor_node = grupo2_pkg.proximity_sensor_node:main',
         ],
     },
 )

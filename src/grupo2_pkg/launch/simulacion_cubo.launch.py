@@ -6,9 +6,9 @@ Levanta:
      y mueve el cubo segun /control/cubo.
   2. waypoint_manager: ejecuta los comandos de /commands/waypoints.
      Una rutina opcional `routine` de grupo2_pkg los publica.
-  3. Opcional: ik_node (ik:=true) y la cinta automatica (cube:=true).
+  3. Opcional: la cinta automatica (cube:=true).
 
-La rutina, ik_node y la cinta arrancan cuando can_module termina la pose inicial.
+La rutina y la cinta arrancan cuando can_module termina la pose inicial.
 P2 y P3 incluyen este launch: interceptar_cubo.launch.py y recoger_cubo.launch.py.
 
 Ejemplos:
@@ -56,7 +56,7 @@ def orden_cubo(datos):
 
 
 def nodos_tras_pose_inicial(context, *args, **kwargs):
-    """Rutina, ik_node y orden de la cinta, segun los argumentos."""
+    """Rutina y orden de la cinta, segun los argumentos."""
     def arg(nombre):
         return LaunchConfiguration(nombre).perform(context)
 
@@ -66,21 +66,11 @@ def nodos_tras_pose_inicial(context, *args, **kwargs):
         output='screen',
     )]
 
-    if arg('ik') == 'true':
-        acciones.append(Node(
-            package='grupo2_pkg',
-            executable='ik_node',
-            name='inverse_kinematics_node',
-            output='screen',
-            parameters=[{'alpha': float(arg('alpha'))}],
-        ))
-
     if arg('routine') != 'none':
         acciones.append(Node(
             package='grupo2_pkg',
             executable=arg('routine'),
             output='screen',
-            parameters=[{'scene': ESCENA}],
         ))
 
     if arg('cube') == 'true':
@@ -123,10 +113,6 @@ def generate_launch_description():
                               description='Lanzar RViz2 junto a MuJoCo'),
         DeclareLaunchArgument('routine', default_value='none',
                               description='Rutina de grupo2_pkg que envia waypoints ("none" = ninguna)'),
-        DeclareLaunchArgument('ik', default_value='false', choices=['true', 'false'],
-                              description='Lanzar ik_node (rutinas que usan /obj_point)'),
-        DeclareLaunchArgument('alpha', default_value='0.5',
-                              description='Paso de Newton-Raphson de ik_node'),
         DeclareLaunchArgument('cube', default_value='true', choices=['true', 'false'],
                               description='Cinta automatica (false si la rutina mueve el cubo)'),
         DeclareLaunchArgument('cube_speed', default_value='0.08',

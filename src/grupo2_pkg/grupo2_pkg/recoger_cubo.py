@@ -24,6 +24,7 @@ import time
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 
 from grupo2_pkg.interceptar_cubo import FIN, InterceptarCubo
 
@@ -106,7 +107,7 @@ def main(args=None):
     node = RecogerCubo()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
