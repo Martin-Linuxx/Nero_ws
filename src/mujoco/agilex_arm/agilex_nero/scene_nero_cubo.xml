@@ -59,5 +59,14 @@
 
     </body>
 
+    <!-- P4: sensor de proximidad simulado -> /proximity (scripts/sim_proximity.py).
+         Mide a lo largo del eje +Z del site, aqui +Y: la direccion de avance del cubo.
+         y_cubo = -0.90 + range + 0.02. Se reubica cambiando pos/zaxis. -->
+    <body name="proximity_sensor" pos="-0.55 -0.90 0.12" zaxis="0 1 0">
+      <geom name="proximity_housing" type="box" size="0.022 0.01 0.008"
+            pos="0 0 -0.009" rgba="0.1 0.4 0.9 1" contype="0" conaffinity="0" mass="0.01"/>
+      <site name="proximity_site" size="0.004" rgba="1 1 0 1"/>
+    </body>
+
   </worldbody>
 </mujoco>
