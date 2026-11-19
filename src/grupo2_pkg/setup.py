@@ -32,7 +32,9 @@ setup(
             'interceptar_cubo = grupo2_pkg.interceptar_cubo:main',
             'recoger_cubo = grupo2_pkg.recoger_cubo:main',
             'ik_node = grupo2_pkg.ik_node:main',
-            'control_test_node = grupo2_pkg.control_test_node:main',
+            'waypoint_manager = grupo2_pkg.waypoint_manager:main',
+            'waypoint_sender = grupo2_pkg.waypoint_sender:main',
+            'pose_probe = grupo2_pkg.pose_probe:main',
         ],
     },
 )
