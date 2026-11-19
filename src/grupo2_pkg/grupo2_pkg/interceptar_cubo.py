@@ -1,828 +1,310 @@
-"""Pregunta 2: cubo móvil e intercepción con ROS 2 + IK_node.py.
+#!/usr/bin/env python3
+"""P2: intercepcion del cubo en la cinta con el sensor de proximidad.
 
-Iniciar MuJoCo (nero), iniciar IK_node.py y ejecutar este archivo.
-El nodo NO controla /control/move_p: publica objetivos en /obj_point.
+El brazo espera sobre la cinta con la pinza abierta y los dedos alineados con
+la via. El sensor (al inicio de la cinta, mirando en +Y) da la posicion del cubo;
+con un ajuste lineal de las ultimas lecturas se estima su velocidad y se predice
+cuando llega a y_encuentro, donde lo para el dedo delantero. La bajada se ordena
+t_bajada + margen segundos antes, para que el dedo ya este en la via.
+
+recoger_cubo.py (P3) reutiliza esta clase con otro punto de encuentro.
+
+  publica  /commands/waypoints       grupo2_interfaces/Waypoint  pose de link7 o apertura
+  publica  /commands/cancel_waypoint std_msgs/UInt16             cancelar un comando por id
+  escucha  /proximity                sensor_msgs/Range           distancia al cubo
+  escucha  /feedback/tcp_pose        geometry_msgs/PoseStamped   pose alcanzada
+  escucha  /feedback/joint_states    sensor_msgs/JointState      apertura real
+
+waypoint_manager ejecuta los comandos en orden, uno tras otro.
+
+Fases: ESPERA -> SOBREVOLAR (abre la pinza a la vez) -> MEDIR -> BAJAR -> VERIFICAR -> FIN
 """
-
-from sensor_msgs.msg import JointState
 
 import math
 import time
 from collections import deque
 
-import mujoco
 import numpy as np
 import rclpy
-
 from geometry_msgs.msg import PoseStamped
+from grupo2_interfaces.msg import Waypoint
 from rclpy.node import Node
-from rclpy.qos import (
-    QoSProfile,
-    ReliabilityPolicy,
-    DurabilityPolicy
-)
-from grupo2_pkg.model_paths import (
-    ESCENA_TAREA,
-    encontrar_escena,
-    encontrar_modelo_ik,
-    resolver_modelo,
-)
-from std_msgs.msg import Bool, Float64MultiArray, String
+from rclpy.time import Time
+from sensor_msgs.msg import JointState, Range
+from std_msgs.msg import UInt16
 
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
+# Orientacion de link7 (x, y, z, w): pinza 30 grados inclinada hacia fuera,
+# apertura a lo largo de la via (+Y). Alcanzable por la IK del brazo.
+Q_LINK7 = (0.348125, 0.624359, -0.597027, 0.364065)
 
-# Orientación de link7 al interceptar.
-#
-# El valor original de la pregunta 2 con el cubo avanzando en X era
-# [-0.144805, -0.669721, 0.707990, -0.171042]. Con él los dedos se abren a lo
-# largo de Y, que ahora es la dirección de avance del cubo: el dedo delantero se
-# queda en el carril y golpea el cubo medio ancho de pinza antes de llegar al
-# centro (se veía como un contacto en y = -0.05 con la pinza abierta 10 cm).
-#
-# Este valor es ese mismo giro compuesto con +90° sobre el eje Z de la base, de
-# modo que los dedos quedan a los lados del carril (apertura en X) y el cubo
-# entra entre ellos. Si la IK se resiste a esta muñeca, el giro de -90° es
-# [-0.575957, -0.371172, 0.621570, 0.379680] y sirve igual.
-# Construida a medida (no compuesta del valor antiguo): el eje de avance de
-# la pinza apunta a -Z de la base (dedos mirando abajo) y la apertura a X
-# (los dedos a los lados del carril del cubo). Verificado sobre el modelo.
-Q_LINK7 = np.array([-0.012296, 0.674037, 0.018427, 0.738365])
+# Pose de link7 con el centro de los dedos sobre el cubo en y = 0 (cubo a
+# [-0.55, 0.0, 0.12] de base_link).
+OBJETIVO_LINK7 = (-0.4889, -0.0235, 0.2409)
 
-# El cubo cruza por delante del robot en el eje Y, a X y Z constantes,
-# simulando una cinta transportadora. El punto de encuentro es la posición del
-# cubo en la escena; el recorrido empieza DISTANCIA_INICIO metros antes en -Y.
-VELOCIDAD_CUBO = 0.08       # m/s
-DISTANCIA_INICIO = 0.80     # m antes del punto de encuentro
-RECORRIDO_CUBO = 1.60       # m: si no se intercepta, sigue de largo
+ESPERA = 'espera'
+SOBREVOLAR = 'sobrevolar'
+MEDIR = 'medir'
+BAJAR = 'bajar'
+VERIFICAR = 'verificar'
+FIN = 'fin'
 
-# Control del brazo
-ALTURA_APROXIMACION = 0.08  # m
-TOLERANCIA = 0.018          # m
-MAX_ESPERA = 12.0           # segundos reales
-
-# Disparo de la bajada: se ordena cuando al cubo le queda este tiempo de viaje
-# hasta el punto de encuentro. Ajustable; el nodo registra en el log cuánto
-# tardó de verdad la bajada ("bajada real") para afinarla.
-TIEMPO_BAJADA = 1.0         # s
-
-# Ventana para estimar la velocidad del cubo con /feedback/cubo_pose. Entre
-# muestras consecutivas (200 Hz) la estimación es ruidosa; promediada sobre esta
-# ventana es estable, y además no le afecta que la simulación no corra
-# exactamente a tiempo real.
-VENTANA_VELOCIDAD = 0.5     # s
-
-# Margen para dar el cubo por pasado de largo
-MARGEN_PASADO = 0.05        # m
-
-# Pinza. El cubo mide 4 cm, asi que con 5.5 cm aun entra entre los dedos: se
-# pre-cierra mientras el cubo viaja para que el cierre final sea corto.
-# Medido en simulacion: 9.6 -> 4.2 cm tarda 3.15 s; 5.5 -> 3 cm, ~1.3 s.
-APERTURA_INICIAL = 0.10     # m
-# El actuador se queda en ~0.096 m aunque se le ordene 0.10, asi que el umbral
-# para darla por abierta tiene que dejar holgura, y ademas hay un plazo maximo:
-# si la pinza se atasca, se sigue adelante avisando en vez de esperar sin fin.
-UMBRAL_ABIERTO = 0.085      # m
-ESPERA_APERTURA = 8.0       # s
-APERTURA_ESPERA = 0.055     # m, pre-cierre mientras espera al cubo
-APERTURA_CIERRE = 0.03      # m, cierre final sobre el cubo
-
-# Antelacion con la que se lanza el cierre final (se calibra como TIEMPO_BAJADA)
-TIEMPO_CIERRE = 1.3         # s
-
-# El cubo se considera ya dentro de la pinza con este margen
-MARGEN_DENTRO = 0.02        # m
-
-# ============================================================
-# FUNCIONES GEOMÉTRICAS
-# ============================================================
-
-def matriz_desde_cuaternion(q):
-
-    x, y, z, w = q / np.linalg.norm(q)
-
-    return np.array([
-        [
-            1 - 2*(y*y + z*z),
-            2*(x*y - z*w),
-            2*(x*z + y*w)
-        ],
-        [
-            2*(x*y + z*w),
-            1 - 2*(x*x + z*z),
-            2*(y*z - x*w)
-        ],
-        [
-            2*(x*z - y*w),
-            2*(y*z + x*w),
-            1 - 2*(x*x + y*y)
-        ]
-    ])
-
-
-def rpy_desde_matriz(R):
-
-    pitch = math.asin(float(np.clip(-R[2, 0], -1.0, 1.0)))
-
-    if abs(math.cos(pitch)) > 1e-7:
-
-        roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
-
-        yaw = math.atan2(float(R[1, 0]), float(R[0, 0]))
-
-    else:
-
-        roll = math.atan2(float(-R[1, 2]), float(R[1, 1]))
-
-        yaw = 0.0
-
-    return np.array([roll, pitch, yaw])
-
-
-def id_cuerpo(modelo, nombre):
-
-    indice = mujoco.mj_name2id(modelo, mujoco.mjtObj.mjOBJ_BODY, nombre)
-
-    if indice < 0:
-        raise RuntimeError(f"No existe el cuerpo '{nombre}'")
-
-    return indice
-
-
-# ============================================================
-# GEOMETRÍA DEL CUBO Y DEL GRIPPER
-# ============================================================
-
-def leer_geometria_simulacion(escena):
-
-    modelo = mujoco.MjModel.from_xml_path(str(escena))
-
-    datos = mujoco.MjData(modelo)
-
-    mujoco.mj_forward(modelo, datos)
-
-    base = id_cuerpo(modelo, "base_link")
-    link7 = id_cuerpo(modelo, "link7")
-    cubo = id_cuerpo(modelo, "cubo_movil")
-
-    R_base = datos.xmat[base].reshape(3, 3)
-    R_link7 = datos.xmat[link7].reshape(3, 3)
-
-    # Posición del cubo respecto de base_link
-    cubo_base = R_base.T @ (datos.xpos[cubo] - datos.xpos[base])
-
-    # Posición global del cubo
-    cubo_world = datos.xpos[cubo].copy()
-
-    centros_dedos = []
-
-    for nombre in ["gripper_link1", "gripper_link2"]:
-
-        i = id_cuerpo(modelo, nombre)
-
-        primero = int(modelo.body_geomadr[i])
-        cantidad = int(modelo.body_geomnum[i])
-
-        if cantidad == 0:
-            raise RuntimeError(f"{nombre} no tiene geometrías")
-
-        centros_dedos.append(np.mean(datos.geom_xpos[primero:primero + cantidad], axis=0))
-
-    # Centro aproximado entre los dedos
-    centro_agarre = np.mean(centros_dedos, axis=0)
-
-    # Desplazamiento respecto de link7
-    offset_dedos = R_link7.T @ (centro_agarre - datos.xpos[link7])
-
-    return cubo_base, cubo_world, offset_dedos
-
-
-# ============================================================
-# REFERENCIA UTILIZADA POR IK_NODE.PY
-# ============================================================
-
-def desplazamiento_del_site_ik(ruta_modelo, base=None):
-
-    ruta = resolver_modelo(ruta_modelo, base)
-
-    modelo = mujoco.MjModel.from_xml_path(str(ruta))
-
-    datos = mujoco.MjData(modelo)
-
-    mujoco.mj_forward(modelo, datos)
-
-    link7 = id_cuerpo(modelo, "link7")
-
-    site = mujoco.mj_name2id(modelo, mujoco.mjtObj.mjOBJ_SITE, "pinch_site")
-
-    if site < 0:
-        raise RuntimeError("El modelo IK no contiene pinch_site")
-
-    R_link7 = datos.xmat[link7].reshape(3, 3)
-
-    R_site = datos.site_xmat[site].reshape(3, 3)
-
-    # Posición relativa de pinch_site respecto de link7
-    offset_site = R_link7.T @ (datos.site_xpos[site] - datos.xpos[link7])
-
-    # Orientación relativa
-    R_site_link7 = R_link7.T @ R_site
-
-    return offset_site, R_site_link7
-
-
-# ============================================================
-# NODO ROS 2
-# ============================================================
 
 class InterceptarCubo(Node):
+    def __init__(self, nombre='interceptar_cubo', **defaults):
+        super().__init__(nombre)
 
-    def __init__(self):
+        self.setup_parameters(defaults)
+        self.init_communications()
 
-        super().__init__("interceptar_cubo")
-
-        # ----------------------------------------------------
-        # Escena MuJoCo (se localiza sin rutas absolutas)
-        # ----------------------------------------------------
-
-        self.declare_parameter("scene", ESCENA_TAREA)
-        self.declare_parameter("model_dir", "")
-
-        nombre_escena = self.get_parameter("scene").get_parameter_value().string_value
-
-        carpeta_escena = self.get_parameter("model_dir").get_parameter_value().string_value
-
-        self.escena = encontrar_escena(nombre_escena, carpeta_escena or None)
-
-        self.get_logger().info(f"Escena MuJoCo: {self.escena}")
-
-        # ----------------------------------------------------
-        # QoS compatible con IK_node.py
-        # ----------------------------------------------------
-
-        qos_ik = QoSProfile(depth=10)
-
-        qos_ik.reliability = ReliabilityPolicy.RELIABLE
-
-        qos_ik.durability = DurabilityPolicy.TRANSIENT_LOCAL
-
-
-        # Comprobar que el gripper esté abierto antes de comenzar
-        self.apertura_gripper_actual = None
-        self.orden_apertura_enviada = False
-
-        self.create_subscription(JointState, "/feedback/joint_states", self.on_joint_states, 10)
-
-        # ----------------------------------------------------
-        # Publicador: objetivo para cinemática inversa
-        # ----------------------------------------------------
-
-        self.pub_objetivo = self.create_publisher(Float64MultiArray, "/obj_point", qos_ik)
-
-        # ----------------------------------------------------
-        # Publicador: movimiento del cubo
-        # ----------------------------------------------------
-
-        self.pub_cubo = self.create_publisher(Float64MultiArray, "/control/cubo", 10)
-
-        # Publicador para controlar el gripper
-        self.pub_gripper = self.create_publisher(JointState, "/control/move_j", 10)
-
-        # ----------------------------------------------------
-        # Suscriptor: posición del extremo del robot
-        # ----------------------------------------------------
-
-        self.create_subscription(PoseStamped, "/feedback/tcp_pose", self.on_tcp, 10)
-
-        # ----------------------------------------------------
-        # Suscriptor: posición del cubo en tiempo real
-        # ----------------------------------------------------
-
-        self.create_subscription(PoseStamped, "/feedback/cubo_pose", self.on_cubo, 10)
-
-        # Aviso del puente cuando el cubo toca el robot
-        self.create_subscription(Bool, "/feedback/cubo_contacto", self.on_contacto, 10)
-
-        # Aviso del puente cuando los DOS dedos tocan el cubo
-        self.create_subscription(Bool, "/feedback/cubo_agarre", self.on_agarre, 10)
-
-        # ----------------------------------------------------
-        # Suscriptores: modelo utilizado por IK_node.py
-        # ----------------------------------------------------
-
-        # QoS TRANSIENT_LOCAL: el publicador de main_node es latched, así que
-        # el modelo llega aunque este nodo arranque después.
-        self.create_subscription(String, "/model_path", self.on_modelo_ik, qos_ik)
-
-        # ----------------------------------------------------
-        # Calcular posición de intercepción
-        # ----------------------------------------------------
-
-        (self.cubo_base, self.cubo_world, self.offset_dedos) = leer_geometria_simulacion(self.escena)
-
-        self.R_link7_obj = matriz_desde_cuaternion(Q_LINK7)
-
-        # Objetivo de link7 para alinear los dedos
-        self.obj_link7 = (self.cubo_base - self.R_link7_obj @ self.offset_dedos + np.array([0.0, 0.0, 0.015]))
-
-        # Posición de aproximación
-        self.aprox_link7 = (self.obj_link7 + np.array([0.0, 0.0, ALTURA_APROXIMACION]))
-
-        # ----------------------------------------------------
-        # Variables de estado
-        # ----------------------------------------------------
+        self.fase = ESPERA
+        self.t0 = None
 
         self.tcp = None
+        self.apertura = None
+        self.muestras = deque()        # (t, y_cubo) de las lecturas validas
+        self.estimacion = None         # (y, v, t) del ultimo ajuste
+        self.t_orden_bajada = None
 
-        # Seguimiento del cubo en tiempo real
-        self.cubo_y = None          # última posición medida (eje de avance)
-        self.cubo_vel = None        # velocidad estimada, m/s
-        self.historial_cubo = deque()   # (instante, y) dentro de la ventana
-        self.disparo_anunciado = False
-        self.momento_disparo = None
-        self.contacto = False
-        self.agarre = False
-        self.momento_cierre = None
-        self.bajada_real = None
-        self.momento_apertura = None
-        self.ultimo_aviso_apertura = 0.0
-
-        self.ruta_modelo_ik = None
-        self.offset_site = None
-        self.R_site_link7 = None
-
-        self.etapa = 0
-        self.momento_etapa = None
-
-        self.inicio_espera_modelo = time.monotonic()
-
-        self.aviso_modelo = False
-        self.intento_fallback = False
-
-        self.timer = self.create_timer(0.1, self.control)
-
-        self.get_logger().info(f"Cubo en base_link: {np.round(self.cubo_base, 4)}")
-
-        self.get_logger().info(f"Objetivo link7: {np.round(self.obj_link7, 4)}")
-
-        self.get_logger().info("Esperando comunicación con IK_node.py...")
+        self.get_logger().info(
+            f'Encuentro en y = {self.y_int:.3f} m. Bajada de {self.altura:.2f} m, '
+            f'T_bajada = {self.t_bajada:.2f} s. Waypoints a "{self.waypoint_topic}".')
 
     # ========================================================
-    # RECIBIR POSICIÓN ACTUAL DEL ROBOT
+    # PARAMETROS Y COMUNICACIONES
     # ========================================================
 
-    def on_tcp(self, msg):
+    def setup_parameters(self, defaults):
+        p = {
+            'waypoint_topic': '/commands/waypoints',
+            'objetivo_link7': list(OBJETIVO_LINK7),   # m, pose de bajada
+            'orientacion_link7': list(Q_LINK7),       # x, y, z, w
+            'altura_sobrevuelo': 0.08,                # m sobre el objetivo
+            'sensor_y': -0.90,                        # m, posicion del sensor en Y
+            'medio_cubo': 0.02,                       # m, del frente al centro del cubo
+            'y_max_medida': 1.0,                      # m, lecturas mas alla se ignoran
+            't_bajada': 1.0,                          # s, lo que tarda la bajada
+            'margen': 0.2,                            # s, adelanto extra
+            'y_encuentro': -0.09,                     # m, donde el dedo delantero para el cubo
+            'ventana': 1.0,                           # s de lecturas para el ajuste
+            'min_muestras': 4,
+            'v_min': 0.01,                            # m/s, por debajo el cubo esta quieto
+            'atipico': 0.03,                          # m, residuo para descartar lectura
+            'apertura_abierta': 0.10,                 # m
+            'umbral_abierto': 0.085,                  # m
+            'tol_pos': 0.015,                         # m
+            'timeout': 15.0,                          # s
+            'margen_pasado': 0.05,                    # m tras y_int para darlo por perdido
+            't_quieto': 1.0,                          # s quieto para darlo por interceptado
+            'tol_bloqueo': 0.03,                      # m alrededor de y_encuentro
+        }
+        p.update(defaults)
+        for k, v in p.items():
+            setattr(self, k, self.declare_parameter(k, v).value)
 
+        self.objetivo = np.array(self.objetivo_link7, dtype=float)
+        self.altura = float(self.altura_sobrevuelo)
+        self.sobrevuelo = self.objetivo + np.array([0.0, 0.0, self.altura])
+        self.y_int = float(self.y_encuentro)
+
+    def init_communications(self):
+        self.pub_waypoint = self.create_publisher(Waypoint, self.waypoint_topic, 10)
+        self.pub_cancelar = self.create_publisher(UInt16, '/commands/cancel_waypoint', 10)
+        self.ultimo_id = 0
+
+        self.create_subscription(Range, '/proximity', self.proximity_cb, 10)
+        self.create_subscription(PoseStamped, '/feedback/tcp_pose', self.tcp_cb, 10)
+        self.create_subscription(JointState, '/feedback/joint_states', self.joint_states_cb, 10)
+
+        self.timer = self.create_timer(0.05, self.rutina_cb)
+
+    # ========================================================
+    # CALLBACKS
+    # ========================================================
+
+    def tcp_cb(self, msg):
         p = msg.pose.position
-
         self.tcp = np.array([p.x, p.y, p.z])
 
-    # ========================================================
-    # RECIBIR MODELO DE IK
-    # ========================================================
+    def joint_states_cb(self, msg):
+        if 'gripper' in msg.name:
+            i = msg.name.index('gripper')
+            if i < len(msg.position):
+                self.apertura = float(msg.position[i])
 
-    def on_modelo_ik(self, msg):
-        if not msg.data:
-            return
-
-        if self.ruta_modelo_ik == msg.data:
-            return
-
-        try:
-            offset, rotacion = desplazamiento_del_site_ik(msg.data, self.escena.parent)
-
-        except Exception as error:
-
-            self.get_logger().error(f"No se pudo leer el modelo IK: {error}")
-            return
-
-        self.ruta_modelo_ik = msg.data
-
-        self.offset_site = offset
-        self.R_site_link7 = rotacion
-
-        self.get_logger().info(f"Modelo IK: {msg.data}")
+    def proximity_cb(self, msg):
+        if not (msg.min_range < msg.range < msg.max_range):
+            return  # sin eco
+        t = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        y = self.sensor_y + msg.range + self.medio_cubo
+        if y > self.y_max_medida:
+            return  # el dedo tapa el cubo: se sigue con la ultima estimacion
+        self.muestras.append((t, y))
+        while self.muestras and t - self.muestras[0][0] > self.ventana:
+            self.muestras.popleft()
+        self.estimacion = self.ajustar()
 
     # ========================================================
-    # PUBLICAR MOVIMIENTO DEL CUBO
+    # ESTIMACION DEL CUBO
     # ========================================================
 
-    def publicar_cubo(self, desplazandose):
-
-        msg = Float64MultiArray()
-
-        x, y, z = self.cubo_world
-
-        # El cubo entra por -Y, a DISTANCIA_INICIO del punto de encuentro, y
-        # recorre RECORRIDO_CUBO: si no se intercepta, pasa de largo.
-        y_inicial = float(y - DISTANCIA_INICIO)
-
-        if desplazandose:
-            msg.data = [float(x), y_inicial, float(z), 0.0, VELOCIDAD_CUBO, 0.0, RECORRIDO_CUBO / VELOCIDAD_CUBO]
-
-        else:
-            msg.data = [float(x), y_inicial, float(z), 0.0, 0.0, 0.0, 5.0]
-
-        self.pub_cubo.publish(msg)
-
-    # ========================================================
-    # ENVIAR OBJETIVO A IK_NODE.PY
-    # ========================================================
-
-    def publicar_ik_para_link7(self, objetivo_link7):
-
-        # Convertir objetivo de link7 al objetivo de pinch_site
-        posicion_site = (objetivo_link7 + self.R_link7_obj @ self.offset_site)
-
-        R_site = (self.R_link7_obj @ self.R_site_link7)
-
-        rpy = rpy_desde_matriz(R_site)
-
-        msg = Float64MultiArray()
-
-        # Formato de /obj_point:
-        # [x, y, z, roll, pitch, yaw]
-
-        msg.data = [float(v) for v in np.concatenate((posicion_site, rpy))]
-
-        self.pub_objetivo.publish(msg)
-
-        self.get_logger().info(f"Objetivo IK: {np.round(msg.data, 4)}")
-
-    # ========================================================
-    # SEGUIMIENTO DEL CUBO EN TIEMPO REAL
-    # ========================================================
-
-    def on_cubo(self, msg):
-
-        ahora = time.monotonic()
-        y = msg.pose.position.y
-
-        self.cubo_y = y
-
-        # Velocidad media sobre una ventana (ver VENTANA_VELOCIDAD).
-        self.historial_cubo.append((ahora, y))
-
-        while (len(self.historial_cubo) > 1
-               and ahora - self.historial_cubo[0][0] > VENTANA_VELOCIDAD):
-            self.historial_cubo.popleft()
-
-        t_viejo, y_viejo = self.historial_cubo[0]
-
-        if ahora - t_viejo > 0.2:
-            self.cubo_vel = (y - y_viejo) / (ahora - t_viejo)
-
-    def on_contacto(self, msg):
-
-        if msg.data:
-            self.contacto = True
-
-    def on_agarre(self, msg):
-
-        self.agarre = bool(msg.data)
-
-    def distancia_al_encuentro(self):
-        """Metros que le faltan al cubo; negativo si ya pasó."""
-        if self.cubo_y is None:
+    def ajustar(self):
+        """Ajuste lineal y(t) sobre la ventana: devuelve (y, v, t) en la ultima muestra."""
+        if len(self.muestras) < self.min_muestras:
             return None
-
-        return self.cubo_base[1] - self.cubo_y
-
-    def tiempo_hasta_encuentro(self):
-        """Segundos que le faltan al cubo para llegar al punto de encuentro.
-
-        None si aún no hay medidas; negativo si ya pasó de largo.
-        """
-        if self.cubo_y is None:
+        t, y = np.array(self.muestras).T
+        v, y0 = np.polyfit(t - t[-1], y, 1)
+        buenas = np.abs(y - (y0 + v * (t - t[-1]))) < self.atipico
+        if buenas.sum() < self.min_muestras:
             return None
+        if not buenas.all():
+            v, y0 = np.polyfit(t[buenas] - t[-1], y[buenas], 1)
+        return float(y0), float(v), float(t[-1])
 
-        restante = self.cubo_base[1] - self.cubo_y
+    def tiempo_hasta_intercepcion(self):
+        """Segundos hasta que el cubo llega a y_int, contados desde ahora."""
+        y, v, t = self.estimacion
+        edad = self.get_clock().now().nanoseconds * 1e-9 - t
+        return (self.y_int - y) / v - edad
 
-        # Se usa la velocidad medida; solo se recurre a la ordenada si aún no
-        # hay medida o el cubo todavía no se mueve.
-        v = self.cubo_vel
-        if v is None or v < 0.01:
-            v = VELOCIDAD_CUBO
-
-        return restante / v
+    def y_actual(self):
+        y, v, t = self.estimacion
+        return y + v * (self.get_clock().now().nanoseconds * 1e-9 - t)
 
     # ========================================================
-    # VERIFICAR POSICIÓN
+    # ORDENES
     # ========================================================
+
+    def nuevo_waypoint(self, comando):
+        """Waypoint con un id nuevo (1..65535) para poder cancelarlo."""
+        self.ultimo_id = self.ultimo_id % 65535 + 1
+        msg = Waypoint()
+        msg.id = self.ultimo_id
+        msg.command = comando
+        return msg
+
+    def enviar_pose(self, pos):
+        """Encola un movimiento de link7 a pos; devuelve su id."""
+        msg = self.nuevo_waypoint(Waypoint.COMMAND_MOVE)
+        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = map(float, pos)
+        (msg.pose.orientation.x, msg.pose.orientation.y,
+         msg.pose.orientation.z, msg.pose.orientation.w) = map(float, self.orientacion_link7)
+        self.pub_waypoint.publish(msg)
+        return msg.id
+
+    def enviar_gripper(self, apertura):
+        """Encola una apertura del gripper; devuelve su id."""
+        msg = self.nuevo_waypoint(Waypoint.COMMAND_GRIPPER)
+        msg.gripper_width = float(apertura)
+        self.pub_waypoint.publish(msg)
+        return msg.id
+
+    def cancelar(self, waypoint_id):
+        """Deja de esperar un comando: el siguiente de la cola se ejecuta ya."""
+        self.pub_cancelar.publish(UInt16(data=waypoint_id))
+
+    # ========================================================
+    # RUTINA
+    # ========================================================
+
+    def cambiar_fase(self, fase):
+        self.fase = fase
+        self.t0 = time.monotonic()
+
+    def expirado(self):
+        return time.monotonic() - self.t0 > self.timeout
 
     def cerca_de(self, objetivo):
+        return self.tcp is not None and math.dist(self.tcp, objetivo) < self.tol_pos
 
-        if self.tcp is None:
-            return False
+    def al_bajar(self):
+        """Siguiente fase con la pinza abajo."""
+        self.cambiar_fase(VERIFICAR)
 
-        error = np.linalg.norm(self.tcp - objetivo)
+    def terminar(self, mensaje, aviso=False):
+        (self.get_logger().warn if aviso else self.get_logger().info)(mensaje)
+        self.fase = FIN
 
-        return error < TOLERANCIA
-
-    # ========================================================
-    # CONTROL AUTOMÁTICO
-    # ========================================================
-
-    def control(self):
-
-        # ----------------------------------------------------
-        # Buscar modelo IK alternativo si es necesario
-        # ----------------------------------------------------
-
-        if self.etapa == 0 and self.offset_site is None:
-
-            if (time.monotonic() - self.inicio_espera_modelo > 3.0 and not self.intento_fallback and not self.aviso_modelo):
-
-                try:
-                    candidato = encontrar_modelo_ik()
-
-                except FileNotFoundError as error:
-                    candidato = None
-
-                    if not self.aviso_modelo:
-                        self.aviso_modelo = True
-
-                        self.get_logger().error(f"No se recibió /model_path y no hay modelo IK local. Comprueba que MuJoCo e IK_node.py estén abiertos. {error}")
-
-                if candidato is not None:
-
-                    self.intento_fallback = True
-
-                    self.get_logger().warn("No se recibió /model_path. Usando modelo IK local; comprueba que sea el mismo de IK_node.py.")
-
-                    self.on_modelo_ik(String(data=str(candidato)))
-
-        # ----------------------------------------------------
-        # ETAPA 0: Esperar ROS 2 e iniciar aproximación
-        # ----------------------------------------------------
-
-        if self.etapa == 0:
-
-            if self.offset_site is None:
-                return
-
-            if self.tcp is None:
-                return
-
-            if self.pub_objetivo.get_subscription_count() == 0:
-                return
-
-            if self.pub_cubo.get_subscription_count() == 0:
-                return
-
-            # Abrir el gripper antes de comenzar
-            if not self.orden_apertura_enviada:
-
-                self.abrir_gripper()
-
-                self.orden_apertura_enviada = True
-                self.momento_apertura = time.monotonic()
-
+    def rutina_cb(self):
+        if self.fase == ESPERA:
+            if (self.tcp is not None
+                    and self.pub_waypoint.get_subscription_count() > 0
+                    and self.pub_cancelar.get_subscription_count() > 0):
+                self.enviar_gripper(self.apertura_abierta)
+                self.enviar_pose(self.sobrevuelo)
                 self.get_logger().info(
-                    f"Esperando que la pinza llegue a {UMBRAL_ABIERTO * 100:.1f} cm "
-                    f"(máximo {ESPERA_APERTURA:.0f} s)...")
+                    f'Abriendo pinza a {100 * self.apertura_abierta:.0f} cm y sobrevolando '
+                    f'{np.round(self.sobrevuelo, 3)}.')
+                self.cambiar_fase(SOBREVOLAR)
 
+        elif self.fase == SOBREVOLAR:
+            abierta = self.apertura is not None and self.apertura >= self.umbral_abierto
+            if abierta and self.cerca_de(self.sobrevuelo):
+                self.get_logger().info('En posicion. Midiendo el cubo con el sensor...')
+                self.cambiar_fase(MEDIR)
+            elif self.expirado():
+                self.terminar(
+                    'No se alcanzo el sobrevuelo con la pinza abierta (IK rechazada?).', aviso=True)
+
+        elif self.fase == MEDIR:
+            if self.estimacion is None:
                 return
+            y, v, _ = self.estimacion
+            if v < self.v_min:
+                return  # cubo quieto o sin medir aun
+            restante = self.tiempo_hasta_intercepcion()
+            if restante < 0.0:
+                self.terminar(
+                    f'Tarde: el cubo ya paso y_encuentro (y = {self.y_actual():.3f} m) antes de '
+                    f'tener el brazo listo.', aviso=True)
+                return
+            if restante <= self.t_bajada + self.margen:
+                self.enviar_pose(self.objetivo)
+                self.t_orden_bajada = time.monotonic()
+                self.get_logger().info(
+                    f'Bajando: cubo en y = {self.y_actual():.3f} m a {v:.3f} m/s, '
+                    f'llega en {restante:.2f} s.')
+                self.cambiar_fase(BAJAR)
 
-            apertura = self.apertura_gripper_actual
-            esperando = time.monotonic() - self.momento_apertura
+        elif self.fase == BAJAR:
+            if self.cerca_de(self.objetivo):
+                bajada = time.monotonic() - self.t_orden_bajada
+                self.get_logger().info(
+                    f'Pinza abajo. Bajada real: {bajada:.2f} s (t_bajada = {self.t_bajada:.2f} s).')
+                self.al_bajar()
+            elif self.expirado():
+                self.terminar('No se alcanzo el punto de bajada.', aviso=True)
 
-            if apertura is None or apertura < UMBRAL_ABIERTO:
-
-                if esperando < ESPERA_APERTURA:
-
-                    # Un aviso por segundo, para ver si está avanzando
-                    if esperando - self.ultimo_aviso_apertura >= 1.0:
-
-                        self.ultimo_aviso_apertura = esperando
-
-                        # can_module publica una pose inicial con el gripper a
-                        # 5 cm al arrancar y pisa nuestra orden: se reenvia.
-                        self.abrir_gripper()
-
-                        medida = "sin datos" if apertura is None else f"{apertura * 100:.1f} cm"
-
-                        self.get_logger().info(
-                            f"Pinza en {medida} tras {esperando:.0f} s...")
-
-                    return
-
-                medida = "sin datos" if apertura is None else f"{apertura * 100:.1f} cm"
-
-                self.get_logger().warn(
-                    f"La pinza se quedó en {medida} tras {ESPERA_APERTURA:.0f} s "
-                    f"(se esperaba {UMBRAL_ABIERTO * 100:.1f} cm). Se continúa igual; "
-                    "si no llegan datos, comprueba /feedback/joint_states.")
-
+        elif self.fase == VERIFICAR:
+            if time.monotonic() - self.t_orden_bajada > self.timeout:
+                self.terminar('Sin conclusion: el cubo no se detuvo ni paso de largo.', aviso=True)
+                return
+            if self.estimacion is None:
+                return
+            y, v, _ = self.estimacion
+            if y > self.y_int + self.margen_pasado:
+                self.terminar(
+                    f'NO INTERCEPTADO: el cubo siguio de largo (y = {y:.3f} m). '
+                    f'Sube t_bajada.', aviso=True)
+            elif abs(v) < self.v_min and abs(y - self.y_int) < self.tol_bloqueo:
+                if time.monotonic() - self.t0 >= self.t_quieto:
+                    self.terminar(f'INTERCEPTADO: cubo detenido en y = {y:.3f} m.')
             else:
-                self.get_logger().info(
-                    f"Pinza abierta a {apertura * 100:.1f} cm. Iniciando intercepción.")
+                self.t0 = time.monotonic()  # sigue moviendose: reinicia el plazo quieto
 
-            # El cubo espera en la entrada de la cinta; el brazo se preposiciona.
-            # Soltarlo antes seria una carrera perdida: el brazo tarda mas en
-            # colocarse que el cubo en cruzar.
-            self.publicar_cubo(desplazandose=False)
-            self.publicar_ik_para_link7(self.aprox_link7)
 
-            self.momento_etapa = time.monotonic()
-
-            self.etapa = 1
-
-            self.get_logger().info(
-                f"FASE 1: preposicionando sobre el punto de encuentro "
-                f"(el cubo entra a {DISTANCIA_INICIO:.2f} m, {VELOCIDAD_CUBO:.2f} m/s).")
-
-        # ----------------------------------------------------
-        # ETAPA 1: Preposicionarse por encima del encuentro
-        # ----------------------------------------------------
-
-        elif self.etapa == 1:
-
-            tiempo = (time.monotonic() - self.momento_etapa)
-
-            llego = self.cerca_de(self.aprox_link7)
-
-            if llego or tiempo > MAX_ESPERA:
-
-                if not llego:
-                    self.get_logger().warn("No se alcanzó la aproximación con la tolerancia indicada.")
-
-                # Brazo listo: ahora sí arranca la cinta.
-                self.publicar_cubo(desplazandose=True)
-
-                # Pre-cierre: el cubo (4 cm) sigue entrando por 5.5 cm, pero el
-                # cierre final pasa a ser corto y llega a tiempo.
-                self.mover_gripper(APERTURA_ESPERA)
-
-                self.get_logger().info(
-                    f"FASE 2: cinta en marcha ({VELOCIDAD_CUBO:.2f} m/s desde "
-                    f"{DISTANCIA_INICIO:.2f} m). Se baja cuando al cubo le "
-                    f"falten {TIEMPO_BAJADA:.2f} s.")
-
-                self.momento_etapa = time.monotonic()
-
-                self.etapa = 2
-
-        # ----------------------------------------------------
-        # ETAPA 2: Esperar al cubo y disparar la bajada
-        # ----------------------------------------------------
-
-        elif self.etapa == 2:
-
-            # Dos eventos independientes, cada uno con su antelación propia:
-            # el cierre de la pinza (lento, 1.3 s) y la bajada (0.5 s). Se
-            # programan para terminar los dos cuando el cubo llegue al centro,
-            # asi que el cierre se lanza antes que la bajada y se solapan.
-
-            restante = self.tiempo_hasta_encuentro()
-            distancia = self.distancia_al_encuentro()
-
-            if restante is None:
-
-                if not self.disparo_anunciado and time.monotonic() - self.momento_etapa > 3.0:
-
-                    self.disparo_anunciado = True
-
-                    self.get_logger().error(
-                        "No llega /feedback/cubo_pose: sin realimentación no se "
-                        "puede sincronizar la maniobra.")
-
-                return
-
-            # --- evento 1: cierre de la pinza ---
-            if (self.momento_cierre is None
-                    and (restante <= TIEMPO_CIERRE or abs(distancia) < MARGEN_DENTRO)):
-
-                self.mover_gripper(APERTURA_CIERRE)
-
-                self.momento_cierre = time.monotonic()
-
-                self.get_logger().info(
-                    f"Cerrando la pinza: al cubo le faltan {restante:.2f} s "
-                    f"({distancia * 100:.1f} cm).")
-
-            # --- evento 2: bajada al punto de intercepción ---
-            if self.momento_disparo is None and restante <= TIEMPO_BAJADA:
-
-                self.publicar_ik_para_link7(self.obj_link7)
-
-                self.momento_disparo = time.monotonic()
-
-                self.get_logger().info(
-                    f"FASE 3: bajando. Al cubo le faltan {restante:.2f} s "
-                    f"(y = {self.cubo_y:.3f} m, v = {self.cubo_vel or VELOCIDAD_CUBO:.3f} m/s).")
-
-            # --- registro: cuándo llegó realmente el brazo ---
-            if (self.momento_disparo is not None
-                    and self.bajada_real is None
-                    and self.cerca_de(self.obj_link7)):
-
-                self.bajada_real = time.monotonic() - self.momento_disparo
-
-                self.get_logger().info(
-                    f"Brazo en el punto de intercepción. Bajada real: "
-                    f"{self.bajada_real:.2f} s (TIEMPO_BAJADA = {TIEMPO_BAJADA:.2f} s). "
-                    f"Ajuste sugerido: {1.5 * self.bajada_real:.2f} s.")
-
-            # --- veredicto ---
-            if self.agarre:
-
-                cierre = time.monotonic() - self.momento_cierre
-
-                self.get_logger().info(
-                    f"ATRAPADO: los dos dedos sujetan el cubo. Cierre real: "
-                    f"{cierre:.2f} s (TIEMPO_CIERRE = {TIEMPO_CIERRE:.2f} s).")
-
-                self.etapa = 6
-
-                return
-
-            # Si el cubo se detuvo al rozar un dedo nunca pasará de largo:
-            # hace falta un plazo máximo para no quedarse esperando.
-            if (self.momento_cierre is not None
-                    and time.monotonic() - self.momento_cierre > MAX_ESPERA
-                    and not self.agarre):
-
-                self.get_logger().warn(
-                    "NO ATRAPADO: la pinza se cerró pero no hay contacto con los "
-                    f"dos dedos (cubo en y = {self.cubo_y:.3f} m). Revisa la "
-                    "alineación de la pinza o APERTURA_CIERRE.")
-
-                self.etapa = 6
-
-                return
-
-            if distancia < -0.15:
-
-                motivo = []
-
-                if self.momento_disparo is None:
-                    motivo.append("no se llegó a bajar (sube TIEMPO_BAJADA)")
-                elif self.bajada_real is None:
-                    motivo.append("el brazo no alcanzó el punto a tiempo")
-
-                if self.momento_cierre is None:
-                    motivo.append("no se llegó a cerrar la pinza (sube TIEMPO_CIERRE)")
-
-                self.get_logger().warn(
-                    f"NO ATRAPADO: el cubo siguió de largo (y = {self.cubo_y:.3f} m)."
-                    + ("  Motivo: " + "; ".join(motivo) + "." if motivo else
-                       "  La pinza se cerró a tiempo pero no sujetó el cubo: "
-                       "revisa la alineación o APERTURA_CIERRE."))
-
-                self.etapa = 6
-
-    def on_joint_states(self, msg):
-
-        if "gripper" in msg.name:
-
-            i = msg.name.index("gripper")
-
-            if i < len(msg.position):
-                self.apertura_gripper_actual = msg.position[i]
-
-    def mover_gripper(self, apertura):
-
-        msg = JointState()
-
-        msg.name = ["gripper"]
-        msg.position = [float(apertura)]
-
-        self.pub_gripper.publish(msg)
-
-        self.get_logger().info(f"Pinza a {apertura * 100:.1f} cm.")
-
-    def abrir_gripper(self):
-
-        self.mover_gripper(APERTURA_INICIAL)
-
-# ============================================================
-# PROGRAMA PRINCIPAL
-# ============================================================
-
-def main():
-
-    rclpy.init()
-
-    nodo = None
-
+def main(args=None):
+    rclpy.init(args=args)
+    node = InterceptarCubo()
     try:
-        nodo = InterceptarCubo()
-
-        rclpy.spin(nodo)
-
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-
     finally:
-        if nodo is not None:
-            nodo.destroy_node()
-
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -8,10 +8,14 @@ Mueve el cubo "cubo_movil" (joint libre "cubo_free") e informa su estado.
   publica  /feedback/cubo_contacto  Bool               el cubo toca el robot
   publica  /feedback/cubo_agarre    Bool               ambos dedos tocan el cubo
 
-/control/cubo coloca el cubo en (x, y, z) (marco mundo) y lo mueve a velocidad
-constante (vx, vy, vz) durante "duracion" segundos de simulacion. Con velocidad 0
-lo mantiene quieto en ese punto. Al terminar, o al tocar el robot, la cinta lo
-suelta y el cubo queda en manos de la fisica (la pinza puede agarrarlo).
+/control/cubo coloca el cubo en (x, y, z) (marco mundo) y pone la cinta a
+velocidad (vx, vy, vz) durante "duracion" segundos de simulacion; despues la cinta
+se para (velocidad 0) y retiene el cubo.
+
+La cinta actua por fuerzas, como una real: mientras el cubo esta a la altura de la
+cinta, el rozamiento lleva su velocidad a la de la cinta, un resorte lo mantiene a
+esa altura y derecho, y se amortigua su giro. Si algo lo bloquea, la cinta lo sigue
+empujando contra el obstaculo. Al levantarlo (mas de ALTURA_CONTACTO) queda libre.
 """
 
 import numpy as np
@@ -25,6 +29,13 @@ CUBE_JOINT = 'cubo_free'
 BASE_BODY = 'base_link'
 FINGER_BODIES = ('gripper_link1', 'gripper_link2')
 
+ROZAMIENTO = 2.0          # N/(m/s), rozamiento con la cinta
+RIGIDEZ_ALTURA = 20.0     # N/m, mantiene el cubo a la altura de la cinta
+AMORT_ALTURA = 0.5        # N/(m/s)
+RIGIDEZ_GIRO = 0.01       # N·m/rad, mantiene el cubo derecho
+AMORT_GIRO = 5e-5         # N·m/(rad/s)
+ALTURA_CONTACTO = 0.01    # m, por encima la cinta no toca el cubo
+
 
 class SimCubo:
     def __init__(self, node, model, data, lock, rate_hz=100.0):
@@ -32,7 +43,7 @@ class SimCubo:
         self.model = model
         self.data = data
         self.lock = lock
-        self.traj = None   # (p0, v, t0, t_fin) en tiempo de simulacion
+        self.cinta = None   # (z_cinta, v_cinta, t_fin) en tiempo de simulacion
 
         self.body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, CUBE_BODY)
         joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, CUBE_JOINT)
@@ -77,8 +88,12 @@ class SimCubo:
         p0 = np.array(msg.data[0:3])
         v = np.array(msg.data[3:6])
         with self.lock:
-            t = self.data.time
-            self.traj = (p0, v, t, t + float(msg.data[6]))
+            q, qd = self.data.qpos, self.data.qvel
+            q[self.qadr:self.qadr + 3] = p0
+            q[self.qadr + 3:self.qadr + 7] = (1.0, 0.0, 0.0, 0.0)
+            qd[self.vadr:self.vadr + 3] = v
+            qd[self.vadr + 3:self.vadr + 6] = 0.0
+            self.cinta = (float(p0[2]), v, self.data.time + float(msg.data[6]))
             self.contacto = False
             self.agarre = False
         self.node.get_logger().info(
@@ -86,20 +101,25 @@ class SimCubo:
             f'durante {msg.data[6]:.1f} s.')
 
     def step(self):
-        """Llamar antes de mj_step, con el lock tomado."""
-        if self.traj is None:
+        """Fuerzas de la cinta sobre el cubo. Llamar antes de mj_step, con el lock tomado."""
+        if self.cinta is None:
             return
-        p0, v, t0, t_fin = self.traj
-        q = self.data.qpos
-        qd = self.data.qvel
+        f = self.data.xfrc_applied[self.body]
+        f[:] = 0.0
+        z_cinta, v, t_fin = self.cinta
+        z = self.data.xpos[self.body][2]
+        if z - z_cinta > ALTURA_CONTACTO:
+            return  # levantado: la cinta no lo toca
         if self.data.time >= t_fin:
-            self.traj = None
-            qd[self.vadr:self.vadr + 6] = 0.0
-            return
-        q[self.qadr:self.qadr + 3] = p0 + v * (self.data.time - t0)
-        q[self.qadr + 3:self.qadr + 7] = (1.0, 0.0, 0.0, 0.0)
-        qd[self.vadr:self.vadr + 3] = v
-        qd[self.vadr + 3:self.vadr + 6] = 0.0
+            v = np.zeros(3)  # cinta parada: retiene el cubo
+        vel = self.data.qvel[self.vadr:self.vadr + 3]
+        w = self.data.qvel[self.vadr + 3:self.vadr + 6]   # marco local del cubo
+        R = self.data.xmat[self.body].reshape(3, 3)
+
+        f[0:2] = ROZAMIENTO * (v[0:2] - vel[0:2])
+        f[2] = RIGIDEZ_ALTURA * (z_cinta - z) - AMORT_ALTURA * vel[2]
+        f[3:6] = (RIGIDEZ_GIRO * np.cross(R[:, 2], [0.0, 0.0, 1.0])
+                  - AMORT_GIRO * (R @ w))
 
     def _leer_contactos(self):
         robot = False
@@ -121,10 +141,7 @@ class SimCubo:
         with self.lock:
             robot, agarre = self._leer_contactos()
             if robot and not self.contacto:
-                # Al tocar el robot, la cinta suelta el cubo y lo detiene.
-                self.traj = None
-                self.data.qvel[self.vadr:self.vadr + 6] = 0.0
-                self.node.get_logger().info('Cinta del cubo: contacto con el robot, cubo detenido.')
+                self.node.get_logger().info('Cinta del cubo: el cubo toca el robot.')
             self.contacto = self.contacto or robot
             self.agarre = agarre
             p_w = self.data.xpos[self.body].copy()

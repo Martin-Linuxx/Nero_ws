@@ -1,11 +1,11 @@
 """P2: intercepcion del cubo movil.
 
-simulacion_cubo.launch.py + la rutina interceptar_cubo, que mueve el cubo ella misma
-por /control/cubo (sin cinta automatica) y controla el brazo via ik_node.
+simulacion_cubo.launch.py (cinta automatica) + la rutina interceptar_cubo, que
+estima la velocidad del cubo con /proximity y mueve el brazo por /commands/waypoints.
 
 Ejemplos:
   ros2 launch grupo2_pkg interceptar_cubo.launch.py
-  ros2 launch grupo2_pkg interceptar_cubo.launch.py rviz:=true alpha:=0.8
+  ros2 launch grupo2_pkg interceptar_cubo.launch.py cube_speed:=0.12 rviz:=true
 """
 
 import os
@@ -23,17 +23,18 @@ def generate_launch_description():
             get_package_share_directory('grupo2_pkg'), 'launch', 'simulacion_cubo.launch.py')),
         launch_arguments={
             'routine': 'interceptar_cubo',
-            'ik': 'true',
-            'cube': 'false',
+            'cube_speed': LaunchConfiguration('cube_speed'),
+            'cube_delay': LaunchConfiguration('cube_delay'),
             'rviz': LaunchConfiguration('rviz'),
-            'alpha': LaunchConfiguration('alpha'),
         }.items(),
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('cube_speed', default_value='0.08',
+                              description='Velocidad de la cinta en +Y (m/s)'),
+        DeclareLaunchArgument('cube_delay', default_value='8.0',
+                              description='Segundos antes de arrancar la cinta (brazo ya en posicion)'),
         DeclareLaunchArgument('rviz', default_value='false', choices=['true', 'false'],
                               description='Lanzar RViz2 junto a MuJoCo'),
-        DeclareLaunchArgument('alpha', default_value='0.5',
-                              description='Paso de Newton-Raphson de ik_node'),
         base,
     ])
