@@ -10,6 +10,7 @@ Tópicos usados (los que levanta `ros2 launch nero_ctrl nero_can_ctrl.launch.py
 mode:=sim rviz:=false`):
 
   publica  /control/move_p        geometry_msgs/PoseStamped  -> pose objetivo
+  publica  /control/servo_p       geometry_msgs/PoseStamped  -> flujo de poses (COMMAND_STREAM)
   publica  /control/move_j        sensor_msgs/JointState     -> vuelta a la pose inicial
   publica  /control/joint_states  sensor_msgs/JointState     -> apertura gripper
   escucha  /feedback/tcp_pose     geometry_msgs/PoseStamped  -> pose alcanzada
@@ -20,6 +21,12 @@ Comandos propios:
   escucha  /commands/waypoints       grupo2_interfaces/Waypoint  -> encolar un comando
   escucha  /commands/cancel_waypoint std_msgs/UInt16             -> cancelar por id (0 = todo)
   escucha  /commands/estop           std_msgs/Empty              -> parada: vacia la cola y clava el brazo
+
+COMMAND_STREAM (seguir un objetivo que se mueve) no pasa por la cola: cada pose se
+reenvia al controlador en cuanto llega, sin esperar la llegada. Si habia un move en
+curso, el flujo lo sustituye (se da por terminado); un gripper en curso sigue a lo
+suyo, asi que se puede abrir o cerrar la pinza mientras se sigue un objetivo. Se
+ignora mientras no hay controlador o mientras se vuelve a la pose inicial tras un fallo.
 """
 
 import math
@@ -42,6 +49,7 @@ from std_msgs.msg import Empty, UInt16
 # Comandos admitidos en grupo2_interfaces/Waypoint
 COMMAND_MOVE = Waypoint.COMMAND_MOVE
 COMMAND_GRIPPER = Waypoint.COMMAND_GRIPPER
+COMMAND_STREAM = Waypoint.COMMAND_STREAM
 
 # Pose inicial que publica nero_ctrl/can_module.py al arrancar (joint1..7 + gripper).
 # El nodo vuelve aquí si un comando falla.
@@ -102,6 +110,10 @@ class WaypointManager(Node):
     def init_communications(self):
         # Publishers
         self.pub_pose = self.create_publisher(PoseStamped, "/control/move_p", 10)
+        # TODO(move_j): /control/servo_p solo existe en el simulador (mujoco_viewer.py).
+        # Para el brazo real, el flujo se convertira aqui a /control/move_j.
+        self.pub_stream = self.create_publisher(PoseStamped, "/control/servo_p", 10)
+        self.streaming = False
         self.pub_joints = self.create_publisher(JointState, "/control/move_j", 10)
         self.pub_direct = self.create_publisher(JointState, "/control/joint_states", 10)
 
@@ -141,8 +153,12 @@ class WaypointManager(Node):
     def waypoint_cb(self, msg):      #? Encolar un comando nuevo
         command = msg.command.strip().lower()
 
+        if command == COMMAND_STREAM:
+            self.stream_waypoint(msg)
+            return
+
         if command not in (COMMAND_MOVE, COMMAND_GRIPPER):
-            self.get_logger().warn(f"Comando desconocido '{msg.command}': descartado. Usa '{COMMAND_MOVE}' o '{COMMAND_GRIPPER}'.")
+            self.get_logger().warn(f"Comando desconocido '{msg.command}': descartado. Usa '{COMMAND_MOVE}', '{COMMAND_GRIPPER}' o '{COMMAND_STREAM}'.")
             return
 
         # El id tiene que ser único mientras esté pendiente, o cancelar sería ambiguo
@@ -218,6 +234,27 @@ class WaypointManager(Node):
         self.next_stage(IDLE)
     # ==================================
 
+
+    def stream_waypoint(self, msg):  #? Flujo: se reenvia ya, sin cola ni espera
+        if self.stage in (WAIT_FEEDBACK, GOING_HOME):
+            self.get_logger().warn(f"Flujo ignorado: {'sin controlador' if self.stage == WAIT_FEEDBACK else 'volviendo a la pose inicial'}.", throttle_duration_sec=2.0)
+            return
+
+        # Un move en curso queda sustituido por el flujo (el gripper sigue a lo suyo)
+        if self.active_waypoint is not None and self.active_waypoint["command"] == COMMAND_MOVE:
+            self.get_logger().info(f"Flujo de poses: sustituye al move id={self.active_waypoint['id']} en curso.")
+            self.finish_active_waypoint()
+
+        if not self.streaming:
+            self.get_logger().info("Flujo de poses iniciado (sin cola ni espera de llegada).")
+            self.streaming = True
+
+        out = PoseStamped()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = "base_link"
+        out.pose = msg.pose
+
+        self.pub_stream.publish(out)
 
     def find_waypoint(self, waypoint_id):
         if self.active_waypoint is not None and self.active_waypoint["id"] == waypoint_id:
@@ -366,6 +403,7 @@ class WaypointManager(Node):
             waypoint = self.active_waypoint
 
             if waypoint["command"] == COMMAND_MOVE:
+                self.streaming = False  # un move encolado termina el flujo anterior
                 self.send_pose_waypoint(waypoint)
 
                 self.get_logger().info(f"Ejecutando id={waypoint['id']} move: pos={waypoint['pos']} ori={waypoint['ori']}")

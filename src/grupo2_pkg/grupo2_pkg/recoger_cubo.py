@@ -8,6 +8,10 @@ apertura baja al ancho del cubo). En ese momento deja de seguir la cinta y lo
 levanta en vertical; el agarre se confirma durante la subida (la apertura se
 mantiene en el ancho del cubo).
 
+El cierre nunca llega a la apertura pedida (el cubo lo frena), asi que al tocar el
+cubo se cancela por id: waypoint_manager deja de esperarlo (si no, saltaria su
+timeout y mandaria el brazo a la pose inicial) y la pinza sigue apretando.
+
 Todo debe pasar antes de que el cubo llegue a s_limite (final de la cinta).
 
 Fases: ESPERA -> SEGUIR -> BAJAR -> CERRAR -> LEVANTAR -> FIN
@@ -35,12 +39,19 @@ class RecogerCubo(InterceptarCubo):
         for k, v in p.items():
             setattr(self, k, self.declare_parameter(k, v).value)
         self.levantado = None
+        self.id_cierre = None
 
     def al_bajar(self):
-        self.enviar_gripper(self.apertura_cerrada)
+        self.id_cierre = self.enviar_gripper(self.apertura_cerrada)
         self.apertura_prev = None
         self.get_logger().info('Cerrando la pinza siguiendo el cubo hasta tocarlo...')
         self.cambiar_fase(CERRAR)
+
+    def fallar(self, mensaje):
+        if self.id_cierre is not None:
+            self.cancelar(self.id_cierre)
+            self.id_cierre = None
+        super().fallar(mensaje)
 
     def rutina_cb(self):
         if self.fase == CERRAR:
@@ -55,7 +66,9 @@ class RecogerCubo(InterceptarCubo):
             if a is not None and a < self.ancho_min:
                 self.fallar(f'NO AGARRADO: la pinza cerro hasta {100 * a:.1f} cm sin cubo.')
             elif tocando:
-                # Se deja de seguir la cinta y se sube desde aqui.
+                # Se deja de seguir la cinta y se sube desde aqui. La pinza sigue apretando.
+                self.cancelar(self.id_cierre)
+                self.id_cierre = None
                 self.levantado = self.p_cmd + np.array([0.0, 0.0, self.altura_levantar])
                 self.get_logger().info(
                     f'Cubo entre los dedos en s = {self.s_en(self.ahora()):.3f} m '
@@ -72,7 +85,7 @@ class RecogerCubo(InterceptarCubo):
             n = float(np.linalg.norm(err))
             lim = self.v_max * self.dt
             self.p_cmd = self.p_cmd + (err if n <= lim else err * lim / n)
-            self.enviar_servo()
+            self.enviar_pose()
             if self.apertura is not None and self.apertura < self.ancho_min:
                 self.terminar('NO LEVANTADO: el cubo se solto al subir.', aviso=True)
             elif n < 1e-4 and np.linalg.norm(self.agarre_medido() - self.levantado) < self.tol_pos:

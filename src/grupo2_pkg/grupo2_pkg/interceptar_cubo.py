@@ -24,13 +24,14 @@ del cubo) se descartan, y desde que empieza la bajada se extrapola sin leer el
 sensor (los dedos lo tapan). Con v_cinta <= 0 la velocidad se estima con un ajuste
 lineal.
 
-Control: a 20 Hz se manda la pose de la brida por /control/servo_p (IK continua en
-el puente). El punto de agarre comandado avanza con la velocidad del cubo mas una
-correccion limitada a v_max, y la orientacion gira hacia la de agarre a w_max.
+Control: todo pasa por waypoint_manager (/commands/waypoints). La pose de espera es
+un COMMAND_MOVE (move_p planificado); el seguimiento es un flujo de COMMAND_STREAM a
+20 Hz (el manager lo reenvia sin cola ni espera); la pinza son COMMAND_GRIPPER. El
+punto de agarre comandado avanza con la velocidad del cubo mas una correccion
+limitada a v_max, y la orientacion gira hacia la de agarre a w_max.
 
-  publica  /control/move_p           geometry_msgs/PoseStamped  pose de espera (planificada)
-  publica  /control/servo_p          geometry_msgs/PoseStamped  pose de link7 (flujo)
-  publica  /control/joint_states     sensor_msgs/JointState     apertura del gripper
+  publica  /commands/waypoints       grupo2_interfaces/Waypoint  move / stream / gripper
+  publica  /commands/cancel_waypoint std_msgs/UInt16             cancelar un comando por id
   escucha  /proximity                sensor_msgs/Range          distancia al cubo
   escucha  /feedback/tcp_pose        geometry_msgs/PoseStamped  pose real de link7
   escucha  /feedback/joint_states    sensor_msgs/JointState     apertura real
@@ -46,11 +47,12 @@ from collections import deque
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from grupo2_interfaces.msg import Waypoint
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, Range
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, UInt16
 
 ESPERA = 'espera'
 PREPARAR = 'preparar'
@@ -169,7 +171,7 @@ class InterceptarCubo(Node):
             'apertura_abierta': 0.10,             # m
             'umbral_abierto': 0.085,              # m
             # Seguimiento
-            'rate': 20.0,                         # Hz de /control/servo_p
+            'rate': 20.0,                         # Hz del flujo de poses (COMMAND_STREAM)
             'v_max': 0.15,                        # m/s, correccion sobre la velocidad del cubo
             'a_max': 0.5,                         # m/s^2, aceleracion maxima del comando (suavidad)
             'kp': 2.0,                            # 1/s, correccion proporcional hacia el objetivo
@@ -220,9 +222,9 @@ class InterceptarCubo(Node):
         return matriz_a_quat(np.column_stack([x7, y7, z7]))
 
     def init_communications(self):
-        self.pub_servo = self.create_publisher(PoseStamped, '/control/servo_p', 10)
-        self.pub_move_p = self.create_publisher(PoseStamped, '/control/move_p', 10)
-        self.pub_directo = self.create_publisher(JointState, '/control/joint_states', 10)
+        self.pub_waypoint = self.create_publisher(Waypoint, '/commands/waypoints', 50)
+        self.pub_cancelar = self.create_publisher(UInt16, '/commands/cancel_waypoint', 10)
+        self.ultimo_id = 0
 
         self.create_subscription(Range, '/proximity', self.proximity_cb, 10)
         self.create_subscription(PoseStamped, '/feedback/tcp_pose', self.tcp_cb, 10)
@@ -313,28 +315,41 @@ class InterceptarCubo(Node):
     # ORDENES
     # ========================================================
 
-    def enviar_servo(self, pub=None):
-        """Publica la pose de link7 que pone el punto de agarre en p_cmd con q_cmd.
+    def nuevo_waypoint(self, comando, con_id=True):
+        """Waypoint con un id nuevo (1..65535) para poder cancelarlo; el flujo va con id 0."""
+        msg = Waypoint()
+        if con_id:
+            self.ultimo_id = self.ultimo_id % 65535 + 1
+            msg.id = self.ultimo_id
+        msg.command = comando
+        return msg
+
+    def enviar_pose(self, comando=Waypoint.COMMAND_STREAM):
+        """Manda la pose de link7 que pone el punto de agarre en p_cmd con q_cmd: por
+        defecto como flujo (COMMAND_STREAM), o como move planificado (COMMAND_MOVE).
 
         Limite duro: el punto de agarre comandado nunca sale de la caja de trabajo ni
         baja de z_min_agarre, pase lo que pase en la estimacion o el control.
         """
         self.p_cmd = np.clip(self.p_cmd, self.caja_lo, self.caja_hi)
         p7 = self.p_cmd - quat_a_matriz(self.q_cmd) @ self.g
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
+        msg = self.nuevo_waypoint(comando, con_id=comando != Waypoint.COMMAND_STREAM)
         msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = map(float, p7)
         (msg.pose.orientation.x, msg.pose.orientation.y,
          msg.pose.orientation.z, msg.pose.orientation.w) = map(float, self.q_cmd)
-        (pub or self.pub_servo).publish(msg)
+        self.pub_waypoint.publish(msg)
+        return msg.id
 
     def enviar_gripper(self, apertura):
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['gripper']
-        msg.position = [float(apertura)]
-        self.pub_directo.publish(msg)
+        """Encola una apertura del gripper; devuelve su id (para cancelarlo)."""
+        msg = self.nuevo_waypoint(Waypoint.COMMAND_GRIPPER)
+        msg.gripper_width = float(apertura)
+        self.pub_waypoint.publish(msg)
+        return msg.id
+
+    def cancelar(self, waypoint_id):
+        """Deja de esperar un comando (la pinza sigue con su orden)."""
+        self.pub_cancelar.publish(UInt16(data=int(waypoint_id)))
 
     def punto_espera(self):
         return self.sensor_p + self.s_espera * self.dir
@@ -366,7 +381,7 @@ class InterceptarCubo(Node):
         self.v_cmd = self.v_cmd + (dv if n <= lim else dv * lim / n)
         self.p_cmd = self.p_cmd + self.v_cmd * self.dt
         self.q_cmd = girar_hacia(self.q_cmd, self.q_agarre, self.w_max * self.dt)
-        self.enviar_servo()
+        self.enviar_pose()
         # Integral del error medido a lo largo de la cinta (solo cerca: lejos manda v_max).
         if self.tcp is not None:
             deseado = self.cubo() + self.offset + np.array([0.0, 0.0, self.altura])
@@ -435,19 +450,20 @@ class InterceptarCubo(Node):
             n = float(np.linalg.norm(err))
             lim = self.v_max * self.dt
             self.p_cmd = self.p_cmd + (err if n <= lim else err * lim / n)
-            self.enviar_servo()
+            self.enviar_pose()
             if n < 1e-4 or self.expirado():
                 self.fase = FIN
             return
 
         if self.fase == ESPERA:
             # No hace falta el cubo para alinearse: solo el brazo y el puente.
-            if self.tcp is not None and self.pub_move_p.get_subscription_count() > 0:
+            if (self.tcp is not None and self.pub_waypoint.get_subscription_count() > 0
+                    and self.pub_cancelar.get_subscription_count() > 0):
                 # Pose ya alineada, altura_aproximacion por encima de la espera, en un solo
                 # movimiento planificado; luego baja en vertical hasta la espera.
                 self.q_cmd = self.q_agarre.copy()
                 self.p_cmd = self.espera() + np.array([0.0, 0.0, self.altura_aproximacion])
-                self.enviar_servo(self.pub_move_p)
+                self.enviar_pose(Waypoint.COMMAND_MOVE)
                 self.aproximando = True
                 self.enviar_gripper(self.apertura_abierta)
                 self.get_logger().info(
@@ -470,7 +486,7 @@ class InterceptarCubo(Node):
             n = float(np.linalg.norm(err))
             lim = self.v_max * self.dt
             self.p_cmd = self.p_cmd + (err if n <= lim else err * lim / n)
-            self.enviar_servo()
+            self.enviar_pose()
             deseado = self.espera()
             e_pos = float(np.linalg.norm(self.agarre_medido() - deseado))
             e_ang = angulo_entre(self.tcp[1], self.q_agarre)

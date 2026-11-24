@@ -8,6 +8,10 @@
 # Comandos admitidos (string para que se lea directo en `ros2 topic echo`)
 string COMMAND_MOVE=move
 string COMMAND_GRIPPER=gripper
+# Flujo de poses (10-50 Hz) para seguir un objetivo que se mueve. NO se encola ni se
+# espera la llegada: cada pose se reenvia al controlador en cuanto llega y la ultima
+# manda. Si habia un move en curso, el flujo lo sustituye. Usa id = 0.
+string COMMAND_STREAM=stream
 
 # Identificador asignado por quien publica, para poder cancelarlo por id.
 # 0 = sin identificador (se ejecuta igual, pero no se puede cancelar por id).
@@ -16,7 +20,7 @@ uint16 id
 # COMMAND_MOVE o COMMAND_GRIPPER
 string command
 
-# Pose de la brida en el marco base_link. Solo se usa si command == COMMAND_MOVE.
+# Pose de la brida en el marco base_link. Solo se usa si command == COMMAND_MOVE o COMMAND_STREAM.
 # Misma convención que /control/move_p (ver src/agx_arm_ros/test/nero/test_move_p.yaml).
 geometry_msgs/Pose pose
 
