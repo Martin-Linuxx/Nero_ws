@@ -9,6 +9,8 @@ Comandos (suscripciones):
   control/joint_states  JointState   posiciones directas (streaming, sin planificar)
   control/move_j        JointState   objetivo articular (arm + 'gripper'); admite flujos a 100 Hz
   control/move_p        PoseStamped  punto a punto: IK + interpolacion articular
+  control/servo_p       PoseStamped  seguimiento cartesiano en flujo (10-50 Hz): IK desde el
+                                     ultimo objetivo + seguidor articular de move_j
   control/move_l        PoseStamped  linea recta cartesiana
   control/move_c        PoseArray    arco circular inicio -> medio -> fin
 
@@ -56,6 +58,17 @@ from sim_proximity import SimProximitySensor
 
 ARM_JOINTS = [f'joint{i}' for i in range(1, 8)]
 FLANGE_BODY = 'link7'
+SERVO_TOL_POS = 0.006  # m, error aceptado en control/servo_p
+SERVO_TOL_ROT = 0.06   # rad
+SERVO_MAX_SALTO = 0.25  # rad, salto articular maximo por mensaje de servo_p (sin cambios de rama)
+
+# Seguridad: ninguna pieza del brazo (colision, desde link1) puede acercarse a menos de
+# MARGEN_SEGURIDAD de un obstaculo (todo lo que no es el robot ni el cubo: cinta, sensor,
+# suelo). Se comprueba la trayectoria articular entera antes de ejecutar cualquier
+# move_p/move_l/move_c/move_j y cada objetivo de servo_p; si no se cumple, se rechaza.
+MARGEN_SEGURIDAD = 0.01   # m
+PASO_COMPROBACION = 0.03  # rad entre configuraciones comprobadas a lo largo de un camino
+CUERPOS_LIBRES = ('cubo_movil',)  # se pueden tocar (el cubo se agarra)
 BASE_BODY = 'base_link'
 
 
@@ -252,6 +265,8 @@ class MujocoBridge(Node):
 
         # Datos auxiliares solo para cinematica/IK (no tocan la simulacion).
         self._ik_data = mujoco.MjData(self.model)
+        self._safe_data = mujoco.MjData(self.model)
+        self._init_seguridad()
 
         # Offset link7 -> brida del SDK, expresado en el marco de link7:
         #   p_brida = p_link7 + R_link7 @ t_off ;  R_brida = R_link7 @ R_off
@@ -278,6 +293,9 @@ class MujocoBridge(Node):
             JointState, move_j_topic, self._on_move_j, 10)
         self.move_p_sub = self.create_subscription(
             PoseStamped, 'control/move_p', self._on_move_p, 10)
+        self.servo_p_sub = self.create_subscription(
+            PoseStamped, 'control/servo_p', self._on_servo_p, 10)
+        self._servo_fallos = 0
         self.move_l_sub = self.create_subscription(
             PoseStamped, 'control/move_l', self._on_move_l, 10)
         self.move_c_sub = self.create_subscription(
@@ -320,6 +338,78 @@ class MujocoBridge(Node):
                     continue
                 self.data.ctrl[actuator_id] = pos
 
+    # -------------------------------------------------------------- seguridad
+    def _init_seguridad(self):
+        m = self.model
+        base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'base_link')
+
+        def del_robot(b):
+            while b > 0:
+                if b == base:
+                    return True
+                b = int(m.body_parentid[b])
+            return False
+
+        libres = {mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, n) for n in CUERPOS_LIBRES}
+        # base_link apoya en el suelo: se excluye. Piezas del robot: geoms de colision.
+        self._geoms_robot = [g for g in range(m.ngeom)
+                             if del_robot(int(m.geom_bodyid[g])) and int(m.geom_bodyid[g]) != base
+                             and (m.geom_contype[g] or m.geom_conaffinity[g])]
+        self._geoms_obst = [g for g in range(m.ngeom)
+                            if not del_robot(int(m.geom_bodyid[g]))
+                            and int(m.geom_bodyid[g]) not in libres]
+        self._fromto = np.zeros(6)
+        self._rechazos = 0
+        self.get_logger().info(
+            f'Seguridad: margen {100 * MARGEN_SEGURIDAD:.0f} cm entre {len(self._geoms_robot)} '
+            f'piezas del brazo y {len(self._geoms_obst)} geoms del entorno.')
+
+    def _holgura(self, q, limite=MARGEN_SEGURIDAD):
+        """Distancia minima (m) del brazo en la configuracion q a cualquier obstaculo.
+        Devuelve (dist, par) con par != None en cuanto encuentra algo a menos de `limite`."""
+        m, d = self.model, self._safe_data
+        d.qpos[:] = self.data.qpos   # gripper y cubo como estan ahora
+        d.qpos[self._arm_qadr] = q
+        mujoco.mj_kinematics(m, d)
+        dmax = max(limite, 0.0) + 0.02
+        best = dmax
+        for a in self._geoms_robot:
+            for b in self._geoms_obst:
+                dist = mujoco.mj_geomDistance(m, d, a, b, dmax, self._fromto)
+                if dist < best:
+                    best = dist
+                    if best < limite:
+                        return best, (a, b)
+        return best, None
+
+    def _camino_seguro(self, Q, que):
+        """True si toda la interpolacion articular por Q respeta el margen; si no, avisa.
+
+        Si el brazo ya esta dentro del margen, se admite un camino que no se acerque
+        mas de lo que ya esta (para poder salir), nunca uno que empeore.
+        """
+        Q = np.asarray(Q, dtype=float)
+        d0, _ = self._holgura(Q[0], -1.0)
+        limite = MARGEN_SEGURIDAD if d0 >= MARGEN_SEGURIDAD else d0 - 0.001
+        for i in range(len(Q) - 1):
+            n = max(1, int(math.ceil(np.abs(Q[i + 1] - Q[i]).max() / PASO_COMPROBACION)))
+            for k in range(1 if i else 0, n + 1):
+                q = Q[i] + (Q[i + 1] - Q[i]) * (k / n)
+                dist, par = self._holgura(q, limite)
+                if par is not None:
+                    self._rechazos += 1
+                    if self._rechazos % 20 == 1:
+                        a, b = par
+                        self.get_logger().warn(
+                            f'{que} RECHAZADO por seguridad: '
+                            f'{mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, int(self.model.geom_bodyid[a]))} '
+                            f'a {1000 * dist:.0f} mm de '
+                            f'{mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, b) or mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, int(self.model.geom_bodyid[b]))} '
+                            f'(margen {1000 * limite:.0f} mm). El brazo no se mueve. '
+                            f'({self._rechazos} rechazos)')
+                    return False
+        return True
+
     # ----------------------------------------------------------- trayectorias
     def _q_now(self):
         with self._data_lock:
@@ -333,6 +423,8 @@ class MujocoBridge(Node):
         total = float(cum[-1])
         if total < 1e-6:
             self.get_logger().info('Ya esta en la posicion objetivo.')
+            return 0.0
+        if not self._camino_seguro(Q, 'Movimiento'):
             return 0.0
         T = max(0.5, total / self.joint_speed, path_len / self.lin_speed)
         with self._data_lock:
@@ -529,6 +621,11 @@ class MujocoBridge(Node):
                 elif name == 'gripper':
                     self._set_gripper_locked(pos)
             if moved:
+                q_desde = np.array(self.data.ctrl[self._arm_aid], dtype=float)
+        if moved and not self._camino_seguro([q_desde, q_goal], 'move_j'):
+            return
+        with self._data_lock:
+            if moved:
                 self._traj = None
                 self._jgoal = q_goal
         if moved and starting:
@@ -547,6 +644,51 @@ class MujocoBridge(Node):
         T = self._start_trajectory([q0, sols[0]])
         if T:
             self.get_logger().info(f'move_p: {T:.1f} s')
+
+    def _on_servo_p(self, msg: PoseStamped):
+        """control/servo_p: pose de la brida en flujo, para seguir objetivos que se mueven.
+
+        move_p replanifica una trayectoria minimum-jerk con cada mensaje (arranca y frena
+        cada vez), asi que no sirve para un flujo. Aqui cada pose se resuelve con una IK
+        sembrada en el ultimo objetivo (soluciones continuas, sin saltos de rama) y se
+        entrega al seguidor articular de move_j, que la alcanza con su limite de
+        velocidad. Si la IK falla se conserva el objetivo anterior.
+        """
+        try:
+            p, q = self._pose_to_arrays(msg.pose)
+        except ValueError as e:
+            self.get_logger().warn(f'servo_p rechazado: {e}')
+            return
+        with self._data_lock:
+            seed = (self._jgoal if self._jgoal is not None
+                    else self.data.ctrl[self._arm_aid]).copy()
+        q_sol, ok, (ep, er) = self._solve_ik(p, q, seed, max_iter=150)
+        # En un flujo vale una solucion aproximada: el siguiente mensaje la refina. Solo
+        # se descarta si se aleja de verdad (si no, el brazo se queda clavado esperando
+        # una precision que la IK no alcanza en ese punto).
+        if not ok and ep < SERVO_TOL_POS and er < SERVO_TOL_ROT:
+            ok = True
+        salto = float(np.abs(q_sol - seed).max())
+        if ok and salto > SERVO_MAX_SALTO:
+            self._servo_fallos += 1
+            if self._servo_fallos % 20 == 1:
+                self.get_logger().warn(
+                    f'servo_p: la IK pide un salto de {salto:.2f} rad (max {SERVO_MAX_SALTO}): '
+                    f'rechazado para no mover el brazo bruscamente.')
+            return
+        if ok and not self._camino_seguro([seed, q_sol], 'servo_p'):
+            return
+        if not ok:
+            self._servo_fallos += 1
+            if self._servo_fallos % 20 == 1:
+                self.get_logger().warn(
+                    f'servo_p: sin IK (error pos {ep * 1000:.1f} mm, rot {er:.3f} rad); '
+                    f'se mantiene el objetivo anterior ({self._servo_fallos} fallos).')
+            return
+        self._servo_fallos = 0
+        with self._data_lock:
+            self._traj = None
+            self._jgoal = q_sol
 
     def _on_move_l(self, msg: PoseStamped):
         try:

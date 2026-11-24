@@ -1,7 +1,8 @@
 """P2: intercepcion del cubo movil.
 
 simulacion_cubo.launch.py (cinta automatica) + la rutina interceptar_cubo, que
-estima la velocidad del cubo con /proximity y mueve el brazo por /commands/waypoints.
+sigue el cubo por la cinta (estimado con /proximity), alinea la mano, baja con el
+cubo entre los dedos y detiene el brazo para frenarlo (brazo por /control/servo_p).
 
 Ejemplos:
   ros2 launch grupo2_pkg interceptar_cubo.launch.py
@@ -31,9 +32,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('cube_speed', default_value='0.08',
-                              description='Velocidad de la cinta en +Y (m/s)'),
-        DeclareLaunchArgument('cube_delay', default_value='8.0',
-                              description='Segundos antes de arrancar la cinta (brazo ya en posicion)'),
+                              description='Velocidad de la cinta (m/s)'),
+        DeclareLaunchArgument('cube_delay', default_value='1.0',
+                              description='Segundos tras la pose inicial antes de arrancar la cinta'),
         DeclareLaunchArgument('rviz', default_value='false', choices=['true', 'false'],
                               description='Lanzar RViz2 junto a MuJoCo'),
         base,

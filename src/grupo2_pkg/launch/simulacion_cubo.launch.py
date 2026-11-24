@@ -38,11 +38,13 @@ from launch_ros.actions import Node
 
 ESCENA = 'scene_nero_cubo.xml'
 
-# Cinta automatica (marco mundo): el cubo entra en Y_INICIO y recorre RECORRIDO en +Y.
-CUBO_X = -0.55
-CUBO_Z = 0.12
-Y_INICIO = -0.80
-RECORRIDO = 1.60
+# Cinta automatica (marco mundo = base_link). La cinta (cinta.xml) esta centrada en
+# (-0.20, -0.50), a lo largo de Y (y de -0.872 a -0.128), banda a z = 0.064.
+# El cubo entra por el extremo lejano (Y_INICIO) y recorre RECORRIDO en +Y, hacia el brazo.
+CUBO_X = -0.20
+CUBO_Z = 0.085
+Y_INICIO = -0.85
+RECORRIDO = 0.70
 
 # Ultima linea de can_module al enviar la pose inicial.
 FIN_POSE_INICIAL = 'Published initial joint states (attempt 3/3)'
@@ -87,10 +89,12 @@ def nodos_tras_pose_inicial(context, *args, **kwargs):
     )]
 
     if arg('routine') != 'none':
+        # La rutina conoce la velocidad de la cinta: solo estima donde va el cubo.
         acciones.append(Node(
             package='grupo2_pkg',
             executable=arg('routine'),
             output='screen',
+            parameters=[{'v_cinta': float(arg('cube_speed'))}],
         ))
 
     if arg('cube') == 'true':

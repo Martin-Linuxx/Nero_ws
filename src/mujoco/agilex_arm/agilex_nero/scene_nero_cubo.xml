@@ -4,8 +4,13 @@
   Escena del grupo 2 para las preguntas 2 y 3 de la tarea: brazo Nero + un cubo
   movil de 4 cm con articulacion libre.
 
-  Es identica a scene_nero_arm.xml salvo por el body "cubo_movil". Se mantiene
-  como archivo aparte para no contaminar las escenas base del repositorio.
+  Es identica a scene_nero_arm.xml salvo por la cinta (cinta.xml) y el body
+  "cubo_movil". Se mantiene como archivo aparte para no contaminar las escenas
+  base del repositorio.
+
+  Cinta (cinta.xml): centro en (-0.20, -0.50) de base_link, a lo largo de Y
+  (y de -0.872 a -0.128), banda a z = 0.064. El cubo entra por el extremo lejano
+  y avanza en +Y, hacia el brazo.
 
   Nombres que esperan los nodos de grupo2_pkg y el puente mujoco_viewer.py:
     - body  "cubo_movil"  (posicion del cubo)
@@ -17,6 +22,7 @@
 -->
 <mujoco model="nero_scene_cubo">
   <include file="nero_arm.xml"/>
+  <include file="cinta.xml"/>
 
   <statistic center="0 0 0.1" extent="0.4"/>
 
@@ -37,14 +43,12 @@
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <!-- Cubo movil de 4 cm.
-         Viaja a la altura de una cinta transportadora (z = 0.12) cruzando en Y
-         por delante del robot, para que la pinza no tenga que bajar al suelo.
-         gravcomp="1" compensa su peso: hace de cinta sin dibujarla, de modo que
-         el cubo no cae cuando el puente no le esta imponiendo la trayectoria
-         (al arrancar la simulacion y despues del contacto). Quitalo si quieres
-         que el cubo caiga de verdad. -->
-    <body name="cubo_movil" pos="-0.55 0.0 0.12" gravcomp="1">
+    <!-- Cubo movil de 4 cm sobre la banda de la cinta (banda a z = 0.064).
+         Centro a z = 0.085: 1 mm sobre la banda, asi la cinta (sim_cubo.py) lo
+         arrastra sin rozar con la geometria estatica de la banda.
+         gravcomp="1" compensa su peso para que no se hunda en la banda mientras
+         el puente no le impone la trayectoria (al arrancar y tras el contacto). -->
+    <body name="cubo_movil" pos="-0.20 -0.85 0.085" gravcomp="1">
 
       <freejoint name="cubo_free"/>
 
@@ -60,9 +64,12 @@
     </body>
 
     <!-- P4: sensor de proximidad simulado -> /proximity (scripts/sim_proximity.py).
-         Mide a lo largo del eje +Z del site, aqui +Y: la direccion de avance del cubo.
-         y_cubo = -0.90 + range + 0.02. Se reubica cambiando pos/zaxis. -->
-    <body name="proximity_sensor" pos="-0.55 -0.90 0.12" zaxis="0 1 0">
+         A la entrada de la cinta (y = -0.92), mirando en +Y: la direccion de avance
+         del cubo. y_cubo = -0.92 + range + 0.02 (minimo 0.05 m con el cubo en la entrada).
+         El eje esta inclinado 0.135 rad hacia arriba (algo mas que la mitad del
+         cono, fov/2 = 0.13) para que ningun rayo toque la banda: el rayo mas bajo
+         va horizontal a la altura del cubo y mide la distancia exacta. -->
+    <body name="proximity_sensor" pos="-0.20 -0.92 0.085" zaxis="0 0.99090 0.13459">
       <geom name="proximity_housing" type="box" size="0.022 0.01 0.008"
             pos="0 0 -0.009" rgba="0.1 0.4 0.9 1" contype="0" conaffinity="0" mass="0.01"/>
       <site name="proximity_site" size="0.004" rgba="1 1 0 1"/>
