@@ -27,7 +27,7 @@ class RecogerCubo(InterceptarCubo):
         super().__init__('recoger_cubo')
         p = {
             'apertura_cerrada': 0.0,      # m, orden de cierre
-            'ancho_min': 0.03,            # m, apertura minima con el cubo entre los dedos
+            'ancho_min': 0.025,           # m, por debajo no hay cubo (con cubo cierra a ~3.0-3.6 cm)
             'ancho_max': 0.05,            # m
             'cierre_detenido': 0.001,     # m por ciclo: menos que esto = los dedos ya no cierran
             'altura_levantar': 0.10,      # m

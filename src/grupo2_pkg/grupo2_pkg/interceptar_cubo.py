@@ -132,7 +132,8 @@ class InterceptarCubo(Node):
         self.altura = self.altura_sobrevuelo   # del punto de agarre sobre su objetivo
         self.desde_alineado = None
         self.aproximando = False
-        self.correccion = np.zeros(3)   # m, compensa el error medido (retraso del seguidor, IK)
+        self.correccion = np.zeros(3)   # m, compensa el error horizontal medido (retraso)
+        self.v_cmd = np.zeros(3)        # m/s, velocidad del punto de agarre comandado
 
         self.get_logger().info(
             f'Siguiendo el cubo: cinta desde {np.round(self.sensor_p, 3)} hacia '
@@ -157,11 +158,11 @@ class InterceptarCubo(Node):
             'inclinacion': math.radians(-20.0),   # rad, + hacia la base, - hacia fuera (mas alcance)
             'eje_apertura': [0.0, -1.0, 0.0],     # Z de link7 (a lo largo de la cinta; signo con IK probada)
             'punto_agarre_link7': [0.135, 0.0, -0.0235],  # m, centro de los dedos en link7
-            'offset_agarre': [0.0, 0.0, 0.035],   # m, punto de agarre - centro del cubo (>= 11 mm
+            'offset_agarre': [0.0, 0.0, 0.04],    # m, punto de agarre - centro del cubo (>= 16 mm
                                                   #    de holgura de toda la pinza a la cinta)
             # Limites duros de seguridad para el punto de agarre comandado (base_link).
-            'z_min_agarre': 0.115,                # m, nunca mas bajo (agarre = 0.12)
-            'caja_min': [-0.32, -0.62, 0.115],    # m, zona de trabajo sobre la cinta
+            'z_min_agarre': 0.12,                 # m, nunca mas bajo (agarre = 0.125)
+            'caja_min': [-0.32, -0.62, 0.12],     # m, zona de trabajo sobre la cinta
             'caja_max': [-0.08, -0.10, 0.50],
             'altura_aproximacion': 0.12,          # m, primero llega por encima de la espera
             'altura_sobrevuelo': 0.05,            # m sobre el punto de agarre
@@ -170,6 +171,8 @@ class InterceptarCubo(Node):
             # Seguimiento
             'rate': 20.0,                         # Hz de /control/servo_p
             'v_max': 0.15,                        # m/s, correccion sobre la velocidad del cubo
+            'a_max': 0.5,                         # m/s^2, aceleracion maxima del comando (suavidad)
+            'kp': 2.0,                            # 1/s, correccion proporcional hacia el objetivo
             'w_max': 1.2,                         # rad/s, giro de la mano
             'v_bajada': 0.08,                     # m/s
             't_adelanto': 0.3,                    # s, apunta por delante del cubo (retraso del seguidor)
@@ -346,19 +349,29 @@ class InterceptarCubo(Node):
         return (self.cubo(self.t_adelanto) + self.offset + np.array([0.0, 0.0, self.altura])
                 + self.correccion)
 
-    def seguir(self):
-        """Un paso: p_cmd avanza con el cubo y corrige hacia el objetivo; la mano gira hacia q_agarre."""
-        paso = self.velocidad_cubo() * self.dt
-        err = self.objetivo_agarre() - (self.p_cmd + paso)
-        n = float(np.linalg.norm(err))
-        lim = self.v_max * self.dt
-        self.p_cmd = self.p_cmd + paso + (err if n <= lim else err * lim / n)
+    def seguir(self, v_extra=None):
+        """Un paso del seguimiento, suave: la velocidad deseada es la del objetivo (cubo +
+        v_extra, p. ej. la bajada) mas una correccion proporcional limitada a v_max, y la
+        velocidad comandada solo cambia a a_max (sin tirones que el seguidor articular
+        convierta en cabeceos). La mano gira hacia q_agarre a w_max."""
+        err = self.objetivo_agarre() - self.p_cmd
+        corr = self.kp * err
+        n = float(np.linalg.norm(corr))
+        if n > self.v_max:
+            corr *= self.v_max / n
+        v_des = self.velocidad_cubo() + corr + (np.zeros(3) if v_extra is None else v_extra)
+        dv = v_des - self.v_cmd
+        n = float(np.linalg.norm(dv))
+        lim = self.a_max * self.dt
+        self.v_cmd = self.v_cmd + (dv if n <= lim else dv * lim / n)
+        self.p_cmd = self.p_cmd + self.v_cmd * self.dt
         self.q_cmd = girar_hacia(self.q_cmd, self.q_agarre, self.w_max * self.dt)
         self.enviar_servo()
         # Integral del error medido a lo largo de la cinta (solo cerca: lejos manda v_max).
         if self.tcp is not None:
             deseado = self.cubo() + self.offset + np.array([0.0, 0.0, self.altura])
             e = deseado - self.agarre_medido()
+            e[2] = 0.0   # solo en horizontal: en z peleaba con el seguidor y cabeceaba
             if np.linalg.norm(e) < 0.05:
                 c = self.correccion + self.ki * e * self.dt
                 n = float(np.linalg.norm(c))
@@ -473,6 +486,7 @@ class InterceptarCubo(Node):
             if listo and s_cubo >= self.s_espera - self.d_enganche:
                 self.get_logger().info(
                     f'Alineado y esperando. Cubo en s = {s_cubo:.3f} m: enganchandose a el...')
+                self.v_cmd = np.zeros(3)
                 self.cambiar_fase(SEGUIR)
             elif s_cubo >= self.s_espera:
                 # El cubo ya paso el punto de espera: se le persigue aunque no este alineado.
@@ -514,8 +528,9 @@ class InterceptarCubo(Node):
                                 f'{math.degrees(e_ang):.1f} grados). IK rechazada?')
 
         elif self.fase == BAJAR:
+            bajando = self.altura > 0.0
             self.altura = max(0.0, self.altura - self.v_bajada * self.dt)
-            self.seguir()
+            self.seguir(np.array([0.0, 0.0, -self.v_bajada]) if bajando else None)
             e_pos, _ = self.error_seguimiento()
             self.get_logger().info(
                 f'Bajando: {100 * self.altura:.1f} cm sobre el agarre, error {1000 * e_pos:.0f} mm.',

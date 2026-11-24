@@ -66,7 +66,7 @@ SERVO_MAX_SALTO = 0.25  # rad, salto articular maximo por mensaje de servo_p (si
 # MARGEN_SEGURIDAD de un obstaculo (todo lo que no es el robot ni el cubo: cinta, sensor,
 # suelo). Se comprueba la trayectoria articular entera antes de ejecutar cualquier
 # move_p/move_l/move_c/move_j y cada objetivo de servo_p; si no se cumple, se rechaza.
-MARGEN_SEGURIDAD = 0.01   # m
+MARGEN_SEGURIDAD = 0.015  # m
 PASO_COMPROBACION = 0.03  # rad entre configuraciones comprobadas a lo largo de un camino
 CUERPOS_LIBRES = ('cubo_movil',)  # se pueden tocar (el cubo se agarra)
 BASE_BODY = 'base_link'
@@ -361,7 +361,7 @@ class MujocoBridge(Node):
         self._fromto = np.zeros(6)
         self._rechazos = 0
         self.get_logger().info(
-            f'Seguridad: margen {100 * MARGEN_SEGURIDAD:.0f} cm entre {len(self._geoms_robot)} '
+            f'Seguridad: margen {1000 * MARGEN_SEGURIDAD:.0f} mm entre {len(self._geoms_robot)} '
             f'piezas del brazo y {len(self._geoms_obst)} geoms del entorno.')
 
     def _holgura(self, q, limite=MARGEN_SEGURIDAD):

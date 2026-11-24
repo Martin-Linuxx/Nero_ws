@@ -50,22 +50,40 @@ RECORRIDO = 0.70
 FIN_POSE_INICIAL = 'Published initial joint states (attempt 3/3)'
 
 
+# Linea de can_module al construir el nodo (justo antes de suscribirse a /start_running_nodes).
+CAN_MODULE_LISTO = 'CAN module initialized.'
+
+
 def orden_arranque():
-    """Reenvia /start_running_nodes esperando a que can_module escuche.
+    """Reenvia /start_running_nodes cuando can_module ya existe.
 
     main_node lo publica una sola vez (latcheado, TRANSIENT_LOCAL) al segundo de
     arrancar, pero can_module se suscribe VOLATILE, asi que no recibe el latch si
     el descubrimiento DDS se completa despues de esa publicacion: se queda sin
     arrancar, no manda la pose inicial y con ello no arranca ni la rutina ni la
-    cinta del cubo. Con `-w 1` esperamos a que su suscriptor exista antes de
-    publicar, asi que la entrega esta garantizada. Reenviarlo es inofensivo:
-    can_module ignora el segundo (guarda `if msg.data and not self.start_requested`).
+    cinta del cubo.
+
+    Antes se publicaba al lanzar con `-w 1` (esperar un suscriptor), pero un
+    suscriptor que aun no ha desaparecido de una ejecucion anterior bastaba para
+    publicar antes de que can_module existiera. Ahora se espera a que can_module
+    diga que esta construido y se publica 5 veces en 5 s (-w 1 y -t 5 -r 1).
+    Reenviarlo es inofensivo: can_module ignora los siguientes
+    (guarda `if msg.data and not self.start_requested`).
     """
-    return ExecuteProcess(
-        cmd=['ros2', 'topic', 'pub', '--once', '-w', '1', '/start_running_nodes',
+    publicar = ExecuteProcess(
+        cmd=['ros2', 'topic', 'pub', '-w', '1', '-t', '5', '-r', '1', '/start_running_nodes',
              'std_msgs/msg/Bool', '{data: true}'],
         output='screen',
     )
+    lanzado = []
+
+    def handler(event):
+        if lanzado or CAN_MODULE_LISTO not in event.text.decode(errors='ignore'):
+            return None
+        lanzado.append(True)
+        return [publicar]
+
+    return RegisterEventHandler(OnProcessIO(on_stdout=handler, on_stderr=handler))
 
 
 def orden_cubo(datos):

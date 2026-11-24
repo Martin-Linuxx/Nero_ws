@@ -33,7 +33,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('cube_speed', default_value='0.08',
                               description='Velocidad de la cinta (m/s)'),
-        DeclareLaunchArgument('cube_delay', default_value='1.0',
+        DeclareLaunchArgument('cube_delay', default_value='3.0',
                               description='Segundos tras la pose inicial antes de arrancar la cinta'),
         DeclareLaunchArgument('rviz', default_value='false', choices=['true', 'false'],
                               description='Lanzar RViz2 junto a MuJoCo'),
